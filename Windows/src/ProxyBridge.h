@@ -13,6 +13,15 @@
 extern "C" {
 #endif
 
+/*
+ * v2.1.0 Compile Switch:
+ * Define NB_USE_NETBRIDGE=1 (default) to use the new NetBridge protocol.
+ * Define NB_USE_NETBRIDGE=0 to fall back to the legacy SOCKS5 path.
+ */
+#ifndef NB_USE_NETBRIDGE
+#define NB_USE_NETBRIDGE 1
+#endif
+
 #define MAX_PROXY_CONFIGS 16
 
 typedef void (*LogCallback)(const char* message);
@@ -57,6 +66,13 @@ PROXYBRIDGE_API void ProxyBridge_SetTrafficLoggingEnabled(BOOL enable);
 PROXYBRIDGE_API void ProxyBridge_ClearConnectionLogs(void);  // Clear connection history from memory
 PROXYBRIDGE_API BOOL ProxyBridge_Start(void);
 PROXYBRIDGE_API BOOL ProxyBridge_Stop(void);
+
+// v2.1.0: Version and diagnostics APIs
+PROXYBRIDGE_API UINT32 ProxyBridge_GetVersion(void);
+PROXYBRIDGE_API int    ProxyBridge_GetLastError(void);
+PROXYBRIDGE_API UINT32 ProxyBridge_GetConnectionCount(void);
+PROXYBRIDGE_API UINT32 ProxyBridge_GetSessionCount(void);
+
 #ifdef __cplusplus
 }
 #endif

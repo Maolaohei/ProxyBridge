@@ -9,6 +9,23 @@
 #include <string.h>
 #include "windivert.h"
 
+/* GCC/MinGW compatibility: MinGW's <windows.h> defines __forceinline as
+   "extern __inline__ __attribute__((...))" which conflicts with "static".
+   Undefine and redefine as plain always_inline. */
+#ifdef __GNUC__
+#undef __forceinline
+#define __forceinline __attribute__((always_inline))
+#endif
+
+/* v2.1.0: NetBridge modules */
+#if NB_USE_NETBRIDGE
+#include "include/nb_proto.h"
+#include "security/nb_token.h"
+#include "process/nb_procname.h"
+#include "netbridge/nb_tcp.h"
+#include "netbridge/nb_session.h"
+#endif
+
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
@@ -848,8 +865,13 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                     {
                         add_connection(src_port, src_ip, dest_ip, dest_port, proxy_config_id);
 
+#if NB_USE_NETBRIDGE
+                        /* NetBridge path: redirect to Core UDP port (35001) */
+                        udp_header->DstPort = htons(NB_CORE_UDP_PORT);
+#else
                         // redirect to UDP relay server at 127.0.0.1:34011
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
+#endif
                         ip_header->DstAddr = htonl(INADDR_LOOPBACK);
 
                         // check if source is localhos
@@ -1065,7 +1087,15 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 // branch above handles the actual per-packet redirect.
                 port_set_decided(src_port);
 
+#if NB_USE_NETBRIDGE
+                /* NetBridge path: redirect to port 35000 (Core TCP) instead of 34010.
+                 * The local_proxy_server listener on port 35000 will accept the
+                 * connection and call nb_tcp_forward() to send the NetBridge Header
+                 * and relay traffic directly to Core. */
+                tcp_header->DstPort = htons(NB_CORE_TCP_PORT);
+#else
                 tcp_header->DstPort = htons(g_local_relay_port);
+#endif
 
                 // check if this is localhost -> localhost traffic
                 BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
@@ -3196,6 +3226,27 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
         }
     }
 
+#if NB_USE_NETBRIDGE
+    /* NetBridge: also listen on Core TCP port for direct forwarding */
+    SOCKET nb_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (nb_listen_sock != INVALID_SOCKET) {
+        setsockopt(nb_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+        setsockopt(nb_listen_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+        struct sockaddr_in nb_addr = {0};
+        nb_addr.sin_family = AF_INET;
+        nb_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        nb_addr.sin_port = htons(NB_CORE_TCP_PORT);
+        if (bind(nb_listen_sock, (struct sockaddr *)&nb_addr, sizeof(nb_addr)) == 0 &&
+            listen(nb_listen_sock, SOMAXCONN) == 0) {
+            log_message("[NetBridge] TCP listening on 127.0.0.1:%d", NB_CORE_TCP_PORT);
+        } else {
+            log_message("[NetBridge] Failed to bind TCP port %d (%d)", NB_CORE_TCP_PORT, WSAGetLastError());
+            closesocket(nb_listen_sock);
+            nb_listen_sock = INVALID_SOCKET;
+        }
+    }
+#endif
+
     log_message("Local proxy listening on port %d", g_local_relay_port);
 
     while (running)
@@ -3205,6 +3256,10 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
         FD_SET(listen_sock, &read_fds);
         if (listen_sock6 != INVALID_SOCKET)
             FD_SET(listen_sock6, &read_fds);
+#if NB_USE_NETBRIDGE
+        if (nb_listen_sock != INVALID_SOCKET)
+            FD_SET(nb_listen_sock, &read_fds);
+#endif
         struct timeval timeout = {1, 0};
 
         if (select(0, &read_fds, NULL, NULL, &timeout) <= 0)
@@ -3281,12 +3336,65 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
                 else { closesocket(client_sock6); }
             }
         }
+
+#if NB_USE_NETBRIDGE
+        if (nb_listen_sock != INVALID_SOCKET && FD_ISSET(nb_listen_sock, &read_fds))
+        {
+            struct sockaddr_in nb_client_addr;
+            int nb_addr_len = sizeof(nb_client_addr);
+            SOCKET nb_client_sock = accept(nb_listen_sock, (struct sockaddr *)&nb_client_addr, &nb_addr_len);
+
+            if (nb_client_sock != INVALID_SOCKET)
+            {
+                UINT16 client_port = ntohs(nb_client_addr.sin_port);
+                uint32_t orig_dest_ip;
+                uint16_t orig_dest_port;
+                uint32_t proxy_config_id;
+
+                if (get_connection_full(client_port, &orig_dest_ip, &orig_dest_port, &proxy_config_id))
+                {
+                    /* Look up process name from PID cache */
+                    DWORD pid = 0;
+                    get_process_id_from_connection(ntohl(nb_client_addr.sin_addr.s_addr), client_port);
+                    /* Use nb_procname_get for the TCP header */
+                    const char *proc_name = "";
+
+                    /* Build 16-byte destination address */
+                    uint8_t dst_addr[16] = {0};
+                    dst_addr[0] = (orig_dest_ip >>  0) & 0xFF;
+                    dst_addr[1] = (orig_dest_ip >>  8) & 0xFF;
+                    dst_addr[2] = (orig_dest_ip >> 16) & 0xFF;
+                    dst_addr[3] = (orig_dest_ip >> 24) & 0xFF;
+
+                    /* Forward via NetBridge protocol */
+                    int rc = nb_tcp_forward(
+                        nb_client_sock,
+                        dst_addr, NB_ADDR_IPV4,
+                        orig_dest_port, client_port,
+                        pid, proc_name);
+
+                    if (rc != 0) {
+                        closesocket(nb_client_sock);
+                    }
+                    /* nb_tcp_forward spawns relay threads; on success
+                     * nb_client_sock is owned by those threads. */
+                }
+                else
+                {
+                    closesocket(nb_client_sock);
+                }
+            }
+        }
+#endif
     }
 
     #undef ACCEPT_AND_DISPATCH
 
     closesocket(listen_sock);
     if (listen_sock6 != INVALID_SOCKET) closesocket(listen_sock6);
+#if NB_USE_NETBRIDGE
+    if (nb_listen_sock != INVALID_SOCKET) closesocket(nb_listen_sock);
+#endif
     WSACleanup();
     return 0;
 }
@@ -4534,6 +4642,17 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     InitializeSRWLock(&lock);
     dns_cache_init();
 
+#if NB_USE_NETBRIDGE
+    nb_procname_init();
+    nb_tcp_pool_init();
+    nb_session_init();
+    if (nb_token_init() != 0) {
+        log_message("[NetBridge] WARNING: Token not available, proceeding without auth");
+    } else {
+        log_message("[NetBridge] Token loaded: 0x%08X", nb_token_get());
+    }
+#endif
+
     running = TRUE;
 
     proxy_thread = CreateThread(NULL, 1, local_proxy_server, NULL, 0, NULL);
@@ -4699,6 +4818,12 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
         windivert_handle = INVALID_HANDLE_VALUE;
     }
 
+#if NB_USE_NETBRIDGE
+    nb_session_shutdown();
+    nb_tcp_pool_shutdown();
+    nb_procname_clear();
+#endif
+
     // process alll packets before we stop, make sure packets are not dropped
     for (int i = 0; i < NUM_PACKET_THREADS; i++)
     {
@@ -4756,6 +4881,43 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     log_message("ProxyBridge stopped");
 
     return TRUE;
+}
+
+/* ===== v2.1.0: Version and Diagnostics APIs ===== */
+
+/* Version: major<<16 | minor<<8 | patch */
+#define NB_DLL_VERSION  ((1u << 16) | (1u << 8) | 0)  /* 1.1.0 */
+
+PROXYBRIDGE_API UINT32 ProxyBridge_GetVersion(void)
+{
+    return NB_DLL_VERSION;
+}
+
+PROXYBRIDGE_API int ProxyBridge_GetLastError(void)
+{
+    return (int)GetLastError();
+}
+
+PROXYBRIDGE_API UINT32 ProxyBridge_GetConnectionCount(void)
+{
+    UINT32 count = 0;
+    AcquireSRWLockShared(&lock);
+    for (UINT32 i = 0; i < CONNECTION_HASH_SIZE; i++) {
+        CONNECTION_INFO *ci = connection_hash_table[i];
+        while (ci) { count++; ci = ci->next; }
+    }
+    ReleaseSRWLockShared(&lock);
+    return count;
+}
+
+PROXYBRIDGE_API UINT32 ProxyBridge_GetSessionCount(void)
+{
+#if NB_USE_NETBRIDGE
+    /* UDP sessions are managed by nb_session.c — return 0 for now */
+    return 0;
+#else
+    return 0;
+#endif
 }
 
 

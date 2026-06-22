@@ -7,7 +7,7 @@ param(
     [switch]$NoSign
 )
 
-$WinDivertPath = "C:\WinDivert-2.2.2-A"
+$WinDivertPath = "D:\UGit\v2rayN\v2rayN\WinDivert-2.2.2-A"
 $SourcePath = "src"
 $SourceFile = "ProxyBridge.c"
 $OutputDLL = "ProxyBridgeCore.dll"
@@ -59,12 +59,22 @@ function Compile-MSVC {
     $script:foundVcvarsPath = $vcvarsPath
     $script:foundArch = $Arch
 
-    $clArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
+    $SourceFiles = @(
+    "$SourcePath\$SourceFile",
+    "$SourcePath\security\nb_token.c",
+    "$SourcePath\process\nb_procname.c",
+    "$SourcePath\netbridge\nb_tcp.c",
+    "$SourcePath\netbridge\nb_session.c"
+)
+
+$clArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
               "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
               "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
               "/I`"$WinDivertPath\include`" " +
-              "$SourcePath\$SourceFile " +
-              "/LD " +
+              "/I`"$SourcePath\include`" " +
+              "/I`"$SourcePath`" " +
+              ($SourceFiles -join " ") +
+              " /LD " +
               "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT " +
               "/LIBPATH:`"$WinDivertPath\$Arch`" " +
               "WinDivert.lib ws2_32.lib iphlpapi.lib " +
@@ -93,10 +103,20 @@ function Compile-GCC {
 
     Write-Host "GCC found: $($gccVersion[0])" -ForegroundColor Cyan
 
+    $gccSourceFiles = @(
+        "$SourcePath\$SourceFile",
+        "$SourcePath/security/nb_token.c",
+        "$SourcePath/process/nb_procname.c",
+        "$SourcePath/netbridge/nb_tcp.c",
+        "$SourcePath/netbridge/nb_session.c"
+    )
+
     $cmd = "gcc -shared -O2 -flto -s -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
            "-I`"$WinDivertPath\include`" " +
-           "$SourcePath\$SourceFile " +
-           "-L`"$WinDivertPath\$Arch`" " +
+           "-I`"$SourcePath/include`" " +
+           "-I`"$SourcePath`" " +
+           ($gccSourceFiles -join " ") +
+           " -L`"$WinDivertPath\$Arch`" " +
            "-lWinDivert -lws2_32 -liphlpapi " +
            "-o $OutputDLL"
 
