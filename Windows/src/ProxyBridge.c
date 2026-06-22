@@ -24,6 +24,7 @@
 #include "process/nb_procname.h"
 #include "netbridge/nb_tcp.h"
 #include "netbridge/nb_session.h"
+#include "netbridge/nb_buf.h"
 #endif
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -4837,6 +4838,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 #if NB_USE_NETBRIDGE
     nb_session_shutdown();
     nb_tcp_pool_shutdown();
+    nb_buf_shutdown();
     nb_procname_clear();
 #endif
 

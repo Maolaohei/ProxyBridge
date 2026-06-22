@@ -3,6 +3,7 @@
 #include "src/process/nb_procname.h"
 #include "src/netbridge/nb_session.h"
 #include "src/netbridge/nb_tcp.h"
+#include "src/netbridge/nb_buf.h"
 #include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>
@@ -114,7 +115,7 @@ static void test_tcp_header_serialize(void)
 
     TEST("nb_tcp_header_serialize: padding zeros");
     uint8_t buf2[128];
-    uint32_t total2 = nb_tcp_header_serialize(
+    nb_tcp_header_serialize(
         buf2, sizeof(buf2),
         NB_ADDR_IPV4, 80, 12345,
         dst_addr, 1234, 0xABCDEF01,
@@ -227,6 +228,87 @@ static void test_tcp_pool_init(void)
     PASS();
 }
 
+/* ===== nb_buf.h tests ===== */
+
+static void test_buf_pool(void)
+{
+    TEST("nb_buf_init");
+    nb_buf_init();
+    PASS();
+
+    TEST("nb_buf_acquire_pool SMALL");
+    void *small = nb_buf_acquire_pool(NB_POOL_SMALL);
+    assert(small != NULL);
+    nb_buf_release_pool(small, NB_POOL_SMALL);
+    PASS();
+
+    TEST("nb_buf_acquire_pool MEDIUM");
+    void *medium = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+    assert(medium != NULL);
+    nb_buf_release_pool(medium, NB_POOL_MEDIUM);
+    PASS();
+
+    TEST("nb_buf_acquire_pool LARGE");
+    void *large = nb_buf_acquire_pool(NB_POOL_LARGE);
+    assert(large != NULL);
+    nb_buf_release_pool(large, NB_POOL_LARGE);
+    PASS();
+
+    TEST("nb_buf_pool reuse (acquire same buffer twice)");
+    void *b1 = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+    nb_buf_release_pool(b1, NB_POOL_MEDIUM);
+    void *b2 = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+    assert(b2 == b1); /* should reuse the same buffer */
+    nb_buf_release_pool(b2, NB_POOL_MEDIUM);
+    PASS();
+
+    TEST("nb_buf_pool stress (64 concurrent)");
+    void *bufs[64];
+    for (int i = 0; i < 64; i++)
+        bufs[i] = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+    for (int i = 0; i < 64; i++)
+        assert(bufs[i] != NULL);
+    for (int i = 0; i < 64; i++)
+        nb_buf_release_pool(bufs[i], NB_POOL_MEDIUM);
+    PASS();
+
+    TEST("nb_buf_pool overflow (>64 drops excess)");
+    void *overflow[80];
+    for (int i = 0; i < 80; i++)
+        overflow[i] = nb_buf_acquire_pool(NB_POOL_SMALL);
+    for (int i = 0; i < 80; i++)
+        nb_buf_release_pool(overflow[i], NB_POOL_SMALL);
+    PASS();
+}
+
+static void test_buf_perf(void)
+{
+    TEST("perf: pool alloc vs malloc (100K iterations)");
+    LARGE_INTEGER freq, start, end;
+    QueryPerformanceFrequency(&freq);
+
+    /* Pool path */
+    QueryPerformanceCounter(&start);
+    for (int i = 0; i < 100000; i++) {
+        void *p = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+        nb_buf_release_pool(p, NB_POOL_MEDIUM);
+    }
+    QueryPerformanceCounter(&end);
+    double pool_ms = (double)(end.QuadPart - start.QuadPart) / freq.QuadPart * 1000.0;
+
+    /* malloc path */
+    QueryPerformanceCounter(&start);
+    for (int i = 0; i < 100000; i++) {
+        void *p = malloc(65535);
+        free(p);
+    }
+    QueryPerformanceCounter(&end);
+    double malloc_ms = (double)(end.QuadPart - start.QuadPart) / freq.QuadPart * 1000.0;
+
+    printf("    pool=%.1fms malloc=%.1fms speedup=%.1fx ", pool_ms, malloc_ms, malloc_ms / pool_ms);
+    PASS();
+}
+
 int main(void)
 {
     printf("=== NetBridge Unit Tests ===\n\n");
@@ -237,6 +319,10 @@ int main(void)
     test_tcp_header_serialize();
     test_udp_req_header_size();
 
+    printf("\n[Buffer Pool]\n");
+    test_buf_pool();
+    test_buf_perf();
+
     printf("\n[Process Name Cache]\n");
     test_procname_cache();
 
@@ -245,6 +331,8 @@ int main(void)
 
     printf("\n[TCP Pool]\n");
     test_tcp_pool_init();
+
+    nb_buf_shutdown();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

@@ -2,6 +2,7 @@
 #include "../include/nb_proto.h"
 #include "../security/nb_token.h"
 #include "../process/nb_procname.h"
+#include "nb_buf.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -15,7 +16,7 @@
 
 #define POOL_SIZE         8
 #define POOL_IDLE_TIMEOUT 30000   /* 30s */
-#define RELAY_BUF_SIZE    16384
+#define RELAY_BUF_SIZE    131072  /* 128 KB — fewer syscalls per relay */
 #define RELAY_TIMEOUT_MS  30000   /* 30s per-direction timeout */
 
 typedef struct {
@@ -152,15 +153,23 @@ typedef struct {
 static DWORD WINAPI relay_thread(LPVOID arg)
 {
     RelayArg *r = (RelayArg *)arg;
-    char buf[RELAY_BUF_SIZE];
-    int n;
+
+    /* 128 KB buffer from pool — fewer recv/send syscalls */
+    char *buf = (char *)nb_buf_acquire_pool(NB_POOL_LARGE);
+    if (!buf) {
+        closesocket(r->from);
+        closesocket(r->to);
+        free(r);
+        return 0;
+    }
 
     /* Set timeouts to prevent permanent blocking */
     DWORD timeout = RELAY_TIMEOUT_MS;
     setsockopt(r->from, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(r->to,   SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
 
-    while ((n = recv(r->from, buf, (int)sizeof(buf), 0)) > 0) {
+    int n;
+    while ((n = recv(r->from, buf, NB_BUF_LARGE, 0)) > 0) {
         int sent = 0;
         while (sent < n) {
             int w = send(r->to, buf + sent, n - sent, 0);
@@ -169,6 +178,7 @@ static DWORD WINAPI relay_thread(LPVOID arg)
         }
     }
 done:
+    nb_buf_release_pool(buf, NB_POOL_LARGE);
     shutdown(r->from, SD_BOTH);
     shutdown(r->to,   SD_BOTH);
     closesocket(r->from);

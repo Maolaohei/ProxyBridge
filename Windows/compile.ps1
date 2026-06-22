@@ -64,7 +64,8 @@ function Compile-MSVC {
     "$SourcePath\security\nb_token.c",
     "$SourcePath\process\nb_procname.c",
     "$SourcePath\netbridge\nb_tcp.c",
-    "$SourcePath\netbridge\nb_session.c"
+    "$SourcePath\netbridge\nb_session.c",
+    "$SourcePath\netbridge\nb_buf.c"
 )
 
 $clArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
@@ -108,7 +109,8 @@ function Compile-GCC {
         "$SourcePath/security/nb_token.c",
         "$SourcePath/process/nb_procname.c",
         "$SourcePath/netbridge/nb_tcp.c",
-        "$SourcePath/netbridge/nb_session.c"
+        "$SourcePath/netbridge/nb_session.c",
+        "$SourcePath/netbridge/nb_buf.c"
     )
 
     $cmd = "gcc -shared -O2 -flto -s -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
@@ -179,7 +181,8 @@ $TestFiles = @(
     "$SourcePath/security/nb_token.c",
     "$SourcePath/process/nb_procname.c",
     "$SourcePath/netbridge/nb_tcp.c",
-    "$SourcePath/netbridge/nb_session.c"
+    "$SourcePath/netbridge/nb_session.c",
+    "$SourcePath/netbridge/nb_buf.c"
 )
 
 if ($Compiler -eq 'auto' -or $Compiler -eq 'msvc') {

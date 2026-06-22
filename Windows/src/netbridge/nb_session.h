@@ -12,8 +12,8 @@
  *   - NbUdpReqHeader sent with each packet to Core (127.0.0.1:35001)
  *   - NbUdpRespHeader received from Core, injected back via WinDivert
  *
- * Session key: the loopback socket's local port L (globally unique).
- * Core side uses clientAddr (127.0.0.1:L) as session identifier.
+ * Session key: (pid, src_port, dst_port, dst_addr) — O(1) hash lookup.
+ * Read-heavy workload: SRWLOCK shared for lookups, exclusive for insert/remove.
  */
 
 /* Initialize the session manager. */
@@ -42,7 +42,7 @@ int nb_session_send(
     const uint8_t *dst_addr, uint16_t dst_port,
     const uint8_t *payload, uint16_t payload_len);
 
-/* Cleanup sessions idle for more than 30s. Call periodically. */
+/* Cleanup idle sessions. DNS sessions (dst_port 53) use shorter timeout. */
 void nb_session_cleanup(void);
 
 /* Shutdown all sessions. */
