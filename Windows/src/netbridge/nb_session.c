@@ -13,8 +13,7 @@
 #define __forceinline __attribute__((always_inline))
 #endif
 
-#define SESSION_TIMEOUT_MS       30000   /* 30s default */
-#define SESSION_TIMEOUT_DNS_MS   5000    /* 5s for DNS (port 53) */
+#define SESSION_TIMEOUT_MS       30000   /* 30s */
 #define MAX_SESSIONS             4096
 #define SESSION_HASH_SIZE        256
 #define SESSION_HASH_MASK        (SESSION_HASH_SIZE - 1)
@@ -73,11 +72,6 @@ static __forceinline uint8_t session_hash(uint32_t pid, uint16_t src_port,
 static __forceinline uint64_t now_ms(void)
 {
     return GetTickCount64();
-}
-
-static __forceinline BOOL is_dns_port(uint16_t port)
-{
-    return port == 53;
 }
 
 void nb_session_init(void)
@@ -280,11 +274,6 @@ SOCKET nb_session_get_or_create(
     return sock;
 }
 
-/*
- * Zero-copy send: use WSASendTo scatter-gather to send header and payload
- * as two separate WSABUF entries. The header lives on stack (56 bytes),
- * the payload stays in the caller's original buffer — no memcpy needed.
- */
 int nb_session_send(
     SOCKET session_sock,
     uint32_t pid,
@@ -294,44 +283,38 @@ int nb_session_send(
 {
     if (session_sock == INVALID_SOCKET) return -1;
 
-    /* Build header in a local struct — avoids pool alloc for 56 bytes */
-    NbUdpReqHeader hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic       = NB_MAGIC;
-    hdr.version     = NB_VERSION;
-    hdr.addr_type   = src_addr_type;
-    hdr.protocol    = NB_PROTO_UDP;
-    hdr.dst_port    = dst_port;
-    hdr.src_port    = src_port;
-    if (dst_addr) memcpy(hdr.dst_addr, dst_addr, 16);
-    if (src_addr) memcpy(hdr.src_addr, src_addr, 16);
-    hdr.pid         = pid;
-    hdr.token       = nb_token_get();
-    hdr.payload_len = payload_len;
+    uint32_t total = NB_UDP_REQ_HEADER_SIZE + payload_len;
+
+    uint8_t *buf = (uint8_t *)nb_buf_acquire_pool(NB_POOL_MEDIUM);
+    if (!buf) return -1;
+
+    NbUdpReqHeader *hdr = (NbUdpReqHeader *)buf;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic       = NB_MAGIC;
+    hdr->version     = NB_VERSION;
+    hdr->addr_type   = src_addr_type;
+    hdr->protocol    = NB_PROTO_UDP;
+    hdr->dst_port    = dst_port;
+    hdr->src_port    = src_port;
+    if (dst_addr) memcpy(hdr->dst_addr, dst_addr, 16);
+    if (src_addr) memcpy(hdr->src_addr, src_addr, 16);
+    hdr->pid         = pid;
+    hdr->token       = nb_token_get();
+    hdr->payload_len = payload_len;
+    if (payload && payload_len > 0) {
+        memcpy(buf + NB_UDP_REQ_HEADER_SIZE, payload, payload_len);
+    }
 
     struct sockaddr_in core_addr = {0};
     core_addr.sin_family      = AF_INET;
     core_addr.sin_addr.s_addr = inet_addr(NB_CORE_ADDR);
     core_addr.sin_port        = htons(NB_CORE_UDP_PORT);
 
-    /*
-     * Zero-copy scatter-gather: two WSABUFs, no intermediate contiguous buffer.
-     *   buf[0] = NbUdpReqHeader (56 bytes, on stack)
-     *   buf[1] = original payload (caller's buffer, zero copy)
-     */
-    WSABUF bufs[2];
-    bufs[0].buf = (char *)&hdr;
-    bufs[0].len = NB_UDP_REQ_HEADER_SIZE;
-    bufs[1].buf = (char *)payload;
-    bufs[1].len = payload_len;
+    int ret = sendto(session_sock, (const char *)buf, (int)total, 0,
+                     (struct sockaddr *)&core_addr, sizeof(core_addr));
 
-    DWORD bytes_sent = 0;
-    int ret = WSASendTo(session_sock, bufs, 2, &bytes_sent, 0,
-                        (struct sockaddr *)&core_addr, sizeof(core_addr),
-                        NULL, NULL);
-
-    uint32_t total = NB_UDP_REQ_HEADER_SIZE + payload_len;
-    return (ret == 0 && bytes_sent == total) ? 0 : -1;
+    nb_buf_release_pool(buf, NB_POOL_MEDIUM);
+    return (ret == (int)total) ? 0 : -1;
 }
 
 void nb_session_cleanup(void)
@@ -344,11 +327,7 @@ void nb_session_cleanup(void)
         UdpSession **pp = &g_sessions[i];
         while (*pp) {
             UdpSession *s = *pp;
-            /* DNS sessions get a shorter timeout */
-            uint64_t timeout = is_dns_port(s->dst_port)
-                             ? SESSION_TIMEOUT_DNS_MS
-                             : SESSION_TIMEOUT_MS;
-            if (now - s->last_active > timeout) {
+            if (now - s->last_active > SESSION_TIMEOUT_MS) {
                 InterlockedExchange(&s->stop, 1);
                 closesocket(s->loopback_sock);
                 WaitForSingleObject(s->recv_thread, 1000);
