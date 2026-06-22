@@ -399,6 +399,7 @@ static void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp);
 static void clear_pid_cache(void);
 static void update_has_active_rules(void);
 static void base64_encode(const char* input, char* output, size_t output_size);
+static BOOL WindivertSendPacket(const void *packet, UINT packet_len);
 
 
 static DWORD WINAPI packet_processor(LPVOID arg)
@@ -2031,6 +2032,20 @@ static BOOL any_socks5_config(void)
             return TRUE;
     }
     return FALSE;
+}
+
+/*
+ * WindivertSendPacket: inject a raw IP packet back into the network stack.
+ * Called via nb_session callback (NetBridge UDP response path).
+ */
+static BOOL WindivertSendPacket(const void *packet, UINT packet_len)
+{
+    if (windivert_handle == INVALID_HANDLE_VALUE || packet == NULL)
+        return FALSE;
+    WINDIVERT_ADDRESS addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.Outbound = FALSE;
+    return WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
 }
 
 // dns cache
@@ -4646,6 +4661,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     nb_procname_init();
     nb_tcp_pool_init();
     nb_session_init();
+    nb_session_set_inject_fn(WindivertSendPacket);
     if (nb_token_init() != 0) {
         log_message("[NetBridge] WARNING: Token not available, proceeding without auth");
     } else {

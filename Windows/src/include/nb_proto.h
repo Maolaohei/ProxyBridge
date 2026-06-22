@@ -2,6 +2,8 @@
 #define NB_PROTO_H
 
 #include <stdint.h>
+#include <string.h>
+#include <stddef.h>
 
 /*
  * NetBridge Protocol Definition (v2.1.0)

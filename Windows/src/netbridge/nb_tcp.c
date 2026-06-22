@@ -52,13 +52,31 @@ static SOCKET nb_pool_acquire(void)
                 ReleaseSRWLockExclusive(&g_pool_lock);
                 return g_pool[i].sock;
             }
-            break;
+            /* Found empty slot — create new connection and store it */
+            SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s != INVALID_SOCKET) {
+                struct sockaddr_in sa = {0};
+                sa.sin_family      = AF_INET;
+                sa.sin_addr.s_addr = inet_addr(NB_CORE_ADDR);
+                sa.sin_port        = htons(NB_CORE_TCP_PORT);
+
+                if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+                    g_pool[i].sock = s;
+                    g_pool[i].last_active = GetTickCount64();
+                    ReleaseSRWLockExclusive(&g_pool_lock);
+                    return s;
+                }
+                closesocket(s);
+            }
+            InterlockedExchange(&g_pool[i].in_use, 0);
+            ReleaseSRWLockExclusive(&g_pool_lock);
+            return INVALID_SOCKET;
         }
     }
 
     ReleaseSRWLockExclusive(&g_pool_lock);
 
-    /* No idle connection — create new */
+    /* Pool full — create a temporary connection (not pooled) */
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return INVALID_SOCKET;
 

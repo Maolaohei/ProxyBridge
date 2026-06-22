@@ -172,6 +172,46 @@ function Sign-Binary {
 
 $success = $false
 
+# ── Build and run tests ────────────────────────────────────────────────────
+Write-Host "`nBuilding tests..." -ForegroundColor Green
+$TestFiles = @(
+    "test.c",
+    "$SourcePath/security/nb_token.c",
+    "$SourcePath/process/nb_procname.c",
+    "$SourcePath/netbridge/nb_tcp.c",
+    "$SourcePath/netbridge/nb_session.c"
+)
+
+if ($Compiler -eq 'auto' -or $Compiler -eq 'msvc') {
+    $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vsWhere) {
+        $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ($vsPath) {
+            $vcvarsPath = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+            if (Test-Path $vcvarsPath) {
+                $testClArgs = "/nologo /O2 /W4 /wd4100 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS " +
+                    "/I`"$WinDivertPath\include`" " +
+                    "/I`"$SourcePath\include`" " +
+                    "/I`"$SourcePath`" " +
+                    ($TestFiles -join " ") +
+                    " ws2_32.lib /Fe:test_runner.exe"
+                $testCmd = "`"$vcvarsPath`" $Arch >nul && cl.exe $testClArgs"
+                Write-Host "  Building test_runner.exe..." -ForegroundColor Cyan
+                $testResult = cmd /c $testCmd '2>&1'
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "  Running tests..." -ForegroundColor Cyan
+                    $runResult = cmd /c ".\test_runner.exe" '2>&1'
+                    Write-Host $runResult
+                    Remove-Item "*.obj" -Force -ErrorAction SilentlyContinue
+                } else {
+                    Write-Host "  Test build failed!" -ForegroundColor Red
+                    Write-Host $testResult
+                }
+            }
+        }
+    }
+}
+
 if ($Compiler -eq 'auto') {
     Write-Host "Auto-detecting compiler..." -ForegroundColor Cyan
 

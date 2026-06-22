@@ -19,6 +19,11 @@
 /* Initialize the session manager. */
 void nb_session_init(void);
 
+/* Set the packet injection callback (called from ProxyBridge.c at startup).
+ * The callback signature is: BOOL inject(const void *packet, UINT packet_len) */
+typedef BOOL (*NbPacketInjectFn)(const void *packet, unsigned int packet_len);
+void nb_session_set_inject_fn(NbPacketInjectFn fn);
+
 /* Get or create a session for the given flow.
  * Returns the loopback socket to use for sending to Core.
  * On first call for a flow, creates socket, binds random port,

@@ -33,8 +33,14 @@ static UdpSession *g_sessions[SESSION_HASH_SIZE];
 static SRWLOCK g_lock = SRWLOCK_INIT;
 static BOOL g_initialized = FALSE;
 
-/* WinDivert inject function (defined in ProxyBridge.c) */
-extern BOOL WindivertSendPacket(const void *packet, UINT packet_len);
+/* Packet injection callback — set by ProxyBridge.c at startup */
+typedef BOOL (*NbPacketInjectFn)(const void *packet, UINT packet_len);
+static NbPacketInjectFn g_inject_fn = NULL;
+
+void nb_session_set_inject_fn(NbPacketInjectFn fn)
+{
+    g_inject_fn = fn;
+}
 
 static uint8_t session_hash(uint16_t src_port, uint16_t dst_port) {
     return (uint8_t)((src_port ^ dst_port) & (SESSION_HASH_SIZE - 1));
@@ -71,17 +77,43 @@ static DWORD WINAPI udp_recv_thread(LPVOID arg)
         if (payload_len == 0 ||
             (int)(NB_UDP_RESP_HEADER_SIZE + payload_len) > n) continue;
 
-        /*
-         * TODO: Use WinDivert to inject the UDP reply back to the process.
-         * This requires building a raw IP/UDP packet with:
-         *   src = resp->src_addr:resp->src_port (the original target)
-         *   dst = sess->src_addr:sess->src_port (the original sender)
-         *   payload = payload
-         *
-         * For now, this is a placeholder — the actual injection will be
-         * implemented when integrating with the packet_processor in
-         * ProxyBridge.c (Phase 2.C.7).
-         */
+        /* Build raw IP/UDP packet for WinDivert injection */
+        uint32_t total_len = 20 + 8 + payload_len; /* IP(20) + UDP(8) + payload */
+        uint8_t *pkt = (uint8_t *)calloc(1, total_len);
+        if (!pkt) continue;
+
+        /* IP header */
+        pkt[0] = 0x45;            /* version=4, ihl=5 */
+        pkt[1] = 0x00;            /* TOS */
+        pkt[2] = (total_len >> 8) & 0xFF;
+        pkt[3] = total_len & 0xFF;
+        pkt[4] = 0x00; pkt[5] = 0x00; /* ID */
+        pkt[6] = 0x40; pkt[7] = 0x00; /* Don't Fragment */
+        pkt[8] = 0x40;            /* TTL=64 */
+        pkt[9] = 0x11;            /* protocol=UDP(17) */
+        /* checksum=0 (WinDivert will calculate) */
+        pkt[12] = resp->src_addr[0]; pkt[13] = resp->src_addr[1];
+        pkt[14] = resp->src_addr[2]; pkt[15] = resp->src_addr[3];
+        pkt[16] = sess->src_addr[0]; pkt[17] = sess->src_addr[1];
+        pkt[18] = sess->src_addr[2]; pkt[19] = sess->src_addr[3];
+
+        /* UDP header */
+        uint16_t udp_len = 8 + payload_len;
+        pkt[20] = (resp->src_port >> 8) & 0xFF;
+        pkt[21] = resp->src_port & 0xFF;
+        pkt[22] = (sess->src_port >> 8) & 0xFF;
+        pkt[23] = sess->src_port & 0xFF;
+        pkt[24] = (udp_len >> 8) & 0xFF;
+        pkt[25] = udp_len & 0xFF;
+        /* UDP checksum=0 (optional for IPv4) */
+
+        /* Payload */
+        memcpy(pkt + 28, payload, payload_len);
+
+        /* Inject via callback */
+        if (g_inject_fn)
+            g_inject_fn(pkt, total_len);
+        free(pkt);
 
         sess->last_active = GetTickCount64();
     }
