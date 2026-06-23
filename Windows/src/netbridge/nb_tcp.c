@@ -44,8 +44,9 @@ static PooledConn g_pool[POOL_SIZE];
 static SRWLOCK g_pool_lock = SRWLOCK_INIT;  /* only for shutdown/cleanup */
 static BOOL g_pool_initialized = FALSE;
 
-/* Forward declaration */
+/* Forward declarations */
 static SOCKET nb_pool_create_conn(void);
+static DWORD WINAPI nb_pool_warmup_thread(LPVOID arg);
 
 void nb_tcp_pool_init(void)
 {
@@ -58,15 +59,30 @@ void nb_tcp_pool_init(void)
     }
     g_pool_initialized = TRUE;
 
-    /* Pre-warm: fill half the pool with connections to reduce cold-start latency */
+    /* Pre-warm in background thread — don't block startup */
+    CreateThread(NULL, 0, nb_pool_warmup_thread, NULL, 0, NULL);
+}
+
+static DWORD WINAPI nb_pool_warmup_thread(LPVOID arg)
+{
+    (void)arg;
+    /* Wait a moment for the listener to be ready */
+    Sleep(100);
+
     int warmup = POOL_SIZE / 2;
     for (int i = 0; i < warmup; i++) {
-        SOCKET s = nb_pool_create_conn();
-        if (s != INVALID_SOCKET) {
-            g_pool[i].sock = s;
-            g_pool[i].last_active = GetTickCount64();
+        /* Only fill empty slots */
+        AcquireSRWLockExclusive(&g_pool[i].lock);
+        if (g_pool[i].sock == INVALID_SOCKET) {
+            SOCKET s = nb_pool_create_conn();
+            if (s != INVALID_SOCKET) {
+                g_pool[i].sock = s;
+                g_pool[i].last_active = GetTickCount64();
+            }
         }
+        ReleaseSRWLockExclusive(&g_pool[i].lock);
     }
+    return 0;
 }
 
 void nb_tcp_set_relay_port(uint16_t port)

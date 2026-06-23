@@ -4706,7 +4706,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         }
     }
 
-    Sleep(500);
+    Sleep(200);
 
     snprintf(filter, sizeof(filter),
         "(tcp and (outbound or loopback or (tcp.DstPort == %d or tcp.SrcPort == %d))) or "
