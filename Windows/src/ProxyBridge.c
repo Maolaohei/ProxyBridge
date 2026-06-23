@@ -423,8 +423,8 @@ static DWORD WINAPI packet_processor(LPVOID arg)
         }
 
         /* ── Fast path: classify early drop ──────────────────────────
-         * Non-outbound packets that aren't relay port returns or DNS
-         * responses don't need processing. Drop them immediately. */
+         * Non-outbound packets that aren't relay port returns
+         * don't need processing. Drop them immediately. */
         if (!addr.Outbound && packet_len >= 20)
         {
             UINT8 ip_ver = (packet[0] >> 4) & 0xF;
@@ -438,8 +438,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                     UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));
                     BOOL is_relay = (sp == g_local_relay_port || dp == g_local_relay_port ||
                                      sp == LOCAL_UDP_RELAY_PORT || dp == LOCAL_UDP_RELAY_PORT);
-                    BOOL is_dns = (proto == 17 && dp == 53);
-                    if (!is_relay && !is_dns)
+                    if (!is_relay)
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                         continue;
