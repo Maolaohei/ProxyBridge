@@ -4760,8 +4760,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     Sleep(200);
 
     snprintf(filter, sizeof(filter),
-        "((tcp or udp) and (outbound or loopback or port=%d or port=%d)) or "
-        "(udp and not outbound and port=53)",
+        "((tcp or udp) and (outbound or loopback or port=%d or port=%d))",
         g_local_relay_port, g_local_relay_port);
 
     // Note: Added 'loopback' to filter to capture localhost (127.x.x.x) traffic
