@@ -14,7 +14,7 @@
 
 /* ===== Connection Pool ===== */
 
-#define POOL_SIZE         16
+#define POOL_SIZE         32
 #define POOL_IDLE_TIMEOUT 30000   /* 30s */
 #define RELAY_BUF_SIZE    131072  /* 128 KB — fewer syscalls per relay */
 #define RELAY_TIMEOUT_MS  30000   /* 30s per-direction timeout */
@@ -243,7 +243,7 @@ void nb_tcp_pool_shutdown(void)
 /* ===== IOCP Relay ===== */
 
 #define IOCP_BUF_SIZE  65536
-#define IOCP_WORKERS   4
+#define IOCP_WORKERS   8
 #define IOCP_MAX_CONNS 1024
 
 /* IOCP operation types */
