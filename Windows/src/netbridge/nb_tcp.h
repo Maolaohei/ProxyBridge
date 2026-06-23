@@ -9,16 +9,20 @@
  *
  * When a TCP connection matches a PROXY rule, instead of going through
  * the old SOCKS5 relay path, we:
- *   1. Connect to Core's NetBridge TCP port (127.0.0.1:35000)
+ *   1. Connect to relay port (127.0.0.1:NB_RELAY_TCP_PORT)
  *   2. Send NbTcpHeader with original destination + PID + token
- *   3. Bidirectional relay between original socket and Core connection
+ *   3. Bidirectional relay between original socket and relay connection
  *
- * Connection pool: maintains N pre-established connections to Core
+ * Connection pool: maintains N pre-established connections to relay
  * to avoid TCP handshake overhead per connection.
  */
 
 /* Initialize the TCP pool. Must be called before nb_tcp_forward. */
 void nb_tcp_pool_init(void);
+
+/* Set the relay TCP port (default: NB_CORE_TCP_PORT).
+ * Call before nb_tcp_forward to redirect traffic to NetBridgeBridge. */
+void nb_tcp_set_relay_port(uint16_t port);
 
 /* Forward a TCP connection through NetBridge.
  *   orig_sock   - the original client socket (from WinDivert redirect)

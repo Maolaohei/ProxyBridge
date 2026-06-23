@@ -4901,6 +4901,16 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     return TRUE;
 }
 
+PROXYBRIDGE_API void ProxyBridge_SetRelayPort(UINT16 port)
+{
+#if NB_USE_NETBRIDGE
+    nb_tcp_set_relay_port(port);
+    log_message("[NetBridge] Relay port set to %d", port);
+#else
+    (void)port;
+#endif
+}
+
 /* ===== v2.1.0: Version and Diagnostics APIs ===== */
 
 /* Version: major<<16 | minor<<8 | patch */

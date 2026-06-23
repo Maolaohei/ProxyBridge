@@ -19,6 +19,10 @@
 #define RELAY_BUF_SIZE    131072  /* 128 KB — fewer syscalls per relay */
 #define RELAY_TIMEOUT_MS  30000   /* 30s per-direction timeout */
 
+/* Relay port — defaults to NB_CORE_TCP_PORT (CoreDirect).
+ * Change via nb_tcp_set_relay_port() for Bridge mode. */
+static uint16_t g_relay_port = NB_CORE_TCP_PORT;
+
 typedef struct {
     SOCKET      sock;
     volatile LONG in_use;
@@ -42,6 +46,14 @@ void nb_tcp_pool_init(void)
     g_pool_initialized = TRUE;
 }
 
+void nb_tcp_set_relay_port(uint16_t port)
+{
+    g_relay_port = port;
+    /* Flush pool since connections target the old port */
+    nb_tcp_pool_shutdown();
+    nb_tcp_pool_init();
+}
+
 static SOCKET nb_pool_acquire(void)
 {
     AcquireSRWLockExclusive(&g_pool_lock);
@@ -59,7 +71,7 @@ static SOCKET nb_pool_acquire(void)
                 struct sockaddr_in sa = {0};
                 sa.sin_family      = AF_INET;
                 sa.sin_addr.s_addr = inet_addr(NB_CORE_ADDR);
-                sa.sin_port        = htons(NB_CORE_TCP_PORT);
+                sa.sin_port        = htons(g_relay_port);
 
                 if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
                     g_pool[i].sock = s;
@@ -84,7 +96,7 @@ static SOCKET nb_pool_acquire(void)
     struct sockaddr_in sa = {0};
     sa.sin_family      = AF_INET;
     sa.sin_addr.s_addr = inet_addr(NB_CORE_ADDR);
-    sa.sin_port        = htons(NB_CORE_TCP_PORT);
+    sa.sin_port        = htons(g_relay_port);
 
     if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         closesocket(s);

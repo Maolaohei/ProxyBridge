@@ -64,8 +64,12 @@ PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback);
 PROXYBRIDGE_API void ProxyBridge_SetConnectionCallback(ConnectionCallback callback);
 PROXYBRIDGE_API void ProxyBridge_SetTrafficLoggingEnabled(BOOL enable);
 PROXYBRIDGE_API void ProxyBridge_ClearConnectionLogs(void);  // Clear connection history from memory
-PROXYBRIDGE_API BOOL ProxyBridge_Start(void);
-PROXYBRIDGE_API BOOL ProxyBridge_Stop(void);
+PROXYBRIDGE_API BOOL   ProxyBridge_Start(void);
+PROXYBRIDGE_API BOOL   ProxyBridge_Stop(void);
+
+/* Set relay port for NetBridge protocol (Bridge mode).
+ * Default: 35000 (CoreDirect). Set to 35002 for NetBridgeBridge relay. */
+PROXYBRIDGE_API void   ProxyBridge_SetRelayPort(UINT16 port);
 
 // v2.1.0: Version and diagnostics APIs
 PROXYBRIDGE_API UINT32 ProxyBridge_GetVersion(void);
