@@ -4783,6 +4783,13 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
             case 1058: // ERROR_SERVICE_DISABLED
                 log_message("Failed to open WinDivert (%lu): A stale WinDivert driver entry from a previous install is marked disabled. Reinstall ProxyBridge to fix it, or manually delete the registry key: HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinDivert", wd_err);
                 break;
+            case 87:   // ERROR_INVALID_PARAMETER - driver version mismatch or stale driver
+                log_message("Failed to open WinDivert (%lu): WinDivert driver version mismatch. "
+                    "Another program (e.g. GoodByeDPI, Proxifier) may have installed an older "
+                    "WinDivert driver that doesn't support the 'loopback' filter keyword. "
+                    "Fix: run 'sc delete WinDivert' in an elevated Command Prompt, then restart v2rayN. "
+                    "Or reinstall ProxyBridge to reset the driver.", wd_err);
+                break;
             case 1275: // ERROR_DRIVER_BLOCKED
                 log_message("Failed to open WinDivert (%lu): WinDivert64.sys is blocked by Windows security policy or antivirus (BYOVD protection). Whitelist WinDivert64.sys in your security software.", wd_err);
                 break;
