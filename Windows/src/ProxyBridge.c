@@ -422,6 +422,32 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             continue;
         }
 
+        /* ── Fast path: classify early drop ──────────────────────────
+         * Non-outbound packets that aren't relay port returns or DNS
+         * responses don't need processing. Drop them immediately. */
+        if (!addr.Outbound && packet_len >= 20)
+        {
+            UINT8 ip_ver = (packet[0] >> 4) & 0xF;
+            if (ip_ver == 4 && packet_len >= 24)
+            {
+                UINT8 proto = packet[9];
+                UINT8 ihl = (packet[0] & 0xF) * 4;
+                if (packet_len >= ihl + 4)
+                {
+                    UINT16 sp = ntohs(*(UINT16*)(packet + ihl));
+                    UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));
+                    BOOL is_relay = (sp == g_local_relay_port || dp == g_local_relay_port ||
+                                     sp == LOCAL_UDP_RELAY_PORT || dp == LOCAL_UDP_RELAY_PORT);
+                    BOOL is_dns = (proto == 17 && dp == 53);
+                    if (!is_relay && !is_dns)
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
+            }
+        }
+
         /* ── Fast path: port bitmap skip ──────────────────────────────
          * If both src and dst ports are already decided as DIRECT,
          * skip the expensive ParsePacket + rule matching entirely.
@@ -4735,14 +4761,9 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     Sleep(200);
 
     snprintf(filter, sizeof(filter),
-        "(tcp and (outbound or loopback or (tcp.DstPort == %d or tcp.SrcPort == %d))) or "
-        "(udp and (outbound or loopback or (udp.DstPort == %d or udp.SrcPort == %d))) or "
-        "(udp and not outbound and udp.SrcPort == 53) or "
-        "(ipv6 and udp and not outbound and udp.SrcPort == 53) or "
-        "(ipv6 and tcp and (outbound or loopback or (tcp.DstPort == %d or tcp.SrcPort == %d))) or "
-        "(ipv6 and udp and (outbound or loopback or (udp.DstPort == %d or udp.SrcPort == %d)))",
-        g_local_relay_port, g_local_relay_port, LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT,
-        g_local_relay_port, g_local_relay_port, LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT);
+        "((tcp or udp) and (outbound or loopback or port=%d or port=%d)) or "
+        "(udp and not outbound and port=53)",
+        g_local_relay_port, g_local_relay_port);
 
     // Note: Added 'loopback' to filter to capture localhost (127.x.x.x) traffic
     // This enables proxying local connections for MITM scenarios
