@@ -240,49 +240,205 @@ void nb_tcp_pool_shutdown(void)
     ReleaseSRWLockExclusive(&g_pool_lock);
 }
 
-/* ===== Relay ===== */
+/* ===== IOCP Relay ===== */
+
+#define IOCP_BUF_SIZE  65536
+#define IOCP_WORKERS   4
+#define IOCP_MAX_CONNS 1024
+
+/* IOCP operation types */
+#define IOCP_OP_RECV_ORIG  1
+#define IOCP_OP_SEND_CORE  2
+#define IOCP_OP_RECV_CORE  3
+#define IOCP_OP_SEND_ORIG  4
+
+typedef struct _IOCP_CONN {
+    OVERLAPPED ov_orig_recv;
+    OVERLAPPED ov_orig_send;
+    OVERLAPPED ov_core_recv;
+    OVERLAPPED ov_core_send;
+    WSABUF buf_orig_recv;
+    WSABUF buf_orig_send;
+    WSABUF buf_core_recv;
+    WSABUF buf_core_send;
+    char data_orig_recv[IOCP_BUF_SIZE];
+    char data_orig_send[IOCP_BUF_SIZE];
+    char data_core_recv[IOCP_BUF_SIZE];
+    char data_core_send[IOCP_BUF_SIZE];
+    SOCKET orig_sock;
+    SOCKET core_sock;
+    volatile LONG active;     /* 1 = active, 0 = closing */
+    volatile LONG refcount;   /* prevent double-free */
+} IOCP_CONN;
+
+static HANDLE g_iocp = NULL;
+static volatile LONG g_active_conns = 0;
+
+static IOCP_CONN* iocp_conn_alloc(void)
+{
+    IOCP_CONN *c = (IOCP_CONN *)calloc(1, sizeof(IOCP_CONN));
+    if (!c) return NULL;
+    c->orig_sock = INVALID_SOCKET;
+    c->core_sock = INVALID_SOCKET;
+    c->active = 1;
+    InterlockedExchange(&c->refcount, 2); /* 2 sockets */
+
+    c->buf_orig_recv.buf = c->data_orig_recv;
+    c->buf_orig_recv.len = IOCP_BUF_SIZE;
+    c->buf_orig_send.buf = c->data_orig_send;
+    c->buf_orig_send.len = IOCP_BUF_SIZE;
+    c->buf_core_recv.buf = c->data_core_recv;
+    c->buf_core_recv.len = IOCP_BUF_SIZE;
+    c->buf_core_send.buf = c->data_core_send;
+    c->buf_core_send.len = IOCP_BUF_SIZE;
+
+    InterlockedIncrement(&g_active_conns);
+    return c;
+}
+
+static void iocp_conn_release(IOCP_CONN *c)
+{
+    if (!c) return;
+    if (InterlockedDecrement(&c->refcount) == 0) {
+        if (c->orig_sock != INVALID_SOCKET) closesocket(c->orig_sock);
+        if (c->core_sock != INVALID_SOCKET) closesocket(c->core_sock);
+        InterlockedDecrement(&g_active_conns);
+        free(c);
+    }
+}
+
+/* Post async recv */
+static BOOL iocp_post_recv(SOCKET sock, OVERLAPPED *ov, WSABUF *buf)
+{
+    memset(ov, 0, sizeof(OVERLAPPED));
+    DWORD flags = 0;
+    DWORD bytesRecvd = 0;
+    int rc = WSARecv(sock, buf, 1, &bytesRecvd, &flags, ov, NULL);
+    return (rc == 0 || WSAGetLastError() == WSA_IO_PENDING);
+}
+
+/* Post async send */
+static BOOL iocp_post_send(SOCKET sock, OVERLAPPED *ov, WSABUF *buf)
+{
+    memset(ov, 0, sizeof(OVERLAPPED));
+    DWORD bytesSent = 0;
+    int rc = WSASend(sock, buf, 1, &bytesSent, 0, ov, NULL);
+    return (rc == 0 || WSAGetLastError() == WSA_IO_PENDING);
+}
+
+/* Worker thread — processes IOCP completions */
+static DWORD WINAPI iocp_worker(LPVOID arg)
+{
+    (void)arg;
+    DWORD bytes;
+    ULONG_PTR key;
+    OVERLAPPED *ov;
+
+    while (GetQueuedCompletionStatus(g_iocp, &bytes, &key, &ov, INFINITE))
+    {
+        if (!ov) continue; /* Shutdown signal */
+
+        IOCP_CONN *conn = (IOCP_CONN *)key;
+        if (!conn->active || bytes == 0) {
+            iocp_conn_release(conn);
+            continue;
+        }
+
+        /* Determine which operation completed by comparing ov pointer */
+        if (ov == &conn->ov_orig_recv) {
+            /* Recv from orig → send to core */
+            conn->buf_core_send.buf = conn->data_orig_recv;
+            conn->buf_core_send.len = bytes;
+            if (!iocp_post_send(conn->core_sock, &conn->ov_core_send, &conn->buf_core_send)) {
+                conn->active = 0;
+                iocp_conn_release(conn);
+            }
+        }
+        else if (ov == &conn->ov_core_send) {
+            /* Send to core done → recv more from orig */
+            conn->buf_orig_recv.buf = conn->data_orig_recv;
+            conn->buf_orig_recv.len = IOCP_BUF_SIZE;
+            if (!iocp_post_recv(conn->orig_sock, &conn->ov_orig_recv, &conn->buf_orig_recv)) {
+                conn->active = 0;
+                iocp_conn_release(conn);
+            }
+        }
+        else if (ov == &conn->ov_core_recv) {
+            /* Recv from core → send to orig */
+            conn->buf_orig_send.buf = conn->data_core_recv;
+            conn->buf_orig_send.len = bytes;
+            if (!iocp_post_send(conn->orig_sock, &conn->ov_orig_send, &conn->buf_orig_send)) {
+                conn->active = 0;
+                iocp_conn_release(conn);
+            }
+        }
+        else if (ov == &conn->ov_orig_send) {
+            /* Send to orig done → recv more from core */
+            conn->buf_core_recv.buf = conn->data_core_recv;
+            conn->buf_core_recv.len = IOCP_BUF_SIZE;
+            if (!iocp_post_recv(conn->core_sock, &conn->ov_core_recv, &conn->buf_core_recv)) {
+                conn->active = 0;
+                iocp_conn_release(conn);
+            }
+        }
+    }
+    return 0;
+}
+
+/* Initialize IOCP subsystem — call once */
+static void nb_iocp_init(void)
+{
+    if (g_iocp) return;
+
+    g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, IOCP_WORKERS);
+    if (!g_iocp) return;
+
+    for (int i = 0; i < IOCP_WORKERS; i++) {
+        CreateThread(NULL, 0, iocp_worker, NULL, 0, NULL);
+    }
+}
+
+/* Start IOCP relay for a connection pair */
+static int nb_iocp_relay(SOCKET orig_sock, SOCKET core_sock)
+{
+    if (!g_iocp) nb_iocp_init();
+    if (!g_iocp) return -1;
+
+    IOCP_CONN *conn = iocp_conn_alloc();
+    if (!conn) return -1;
+
+    conn->orig_sock = orig_sock;
+    conn->core_sock = core_sock;
+
+    /* Associate both sockets with IOCP */
+    CreateIoCompletionPort((HANDLE)orig_sock, g_iocp, (ULONG_PTR)conn, 0);
+    CreateIoCompletionPort((HANDLE)core_sock, g_iocp, (ULONG_PTR)conn, 0);
+
+    /* Post initial recv from orig */
+    if (!iocp_post_recv(orig_sock, &conn->ov_orig_recv, &conn->buf_orig_recv)) {
+        conn->active = 0;
+        iocp_conn_release(conn);
+        return -1;
+    }
+
+    /* Post initial recv from core */
+    if (!iocp_post_recv(core_sock, &conn->ov_core_recv, &conn->buf_core_recv)) {
+        conn->active = 0;
+        iocp_conn_release(conn);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ===== Legacy relay (fallback) ===== */
 
 typedef struct {
     SOCKET from;
     SOCKET to;
 } RelayArg;
 
-static DWORD WINAPI relay_thread(LPVOID arg)
-{
-    RelayArg *r = (RelayArg *)arg;
-
-    char *buf = (char *)nb_buf_acquire_pool(NB_POOL_LARGE);
-    if (!buf) {
-        closesocket(r->from);
-        closesocket(r->to);
-        free(r);
-        return 0;
-    }
-
-    DWORD timeout = RELAY_TIMEOUT_MS;
-    setsockopt(r->from, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-    setsockopt(r->to,   SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
-
-    int n;
-    while ((n = recv(r->from, buf, NB_BUF_LARGE, 0)) > 0) {
-        int sent = 0;
-        while (sent < n) {
-            int w = send(r->to, buf + sent, n - sent, 0);
-            if (w <= 0) goto done;
-            sent += w;
-        }
-    }
-done:
-    nb_buf_release_pool(buf, NB_POOL_LARGE);
-    shutdown(r->from, SD_BOTH);
-    shutdown(r->to,   SD_BOTH);
-    closesocket(r->from);
-    closesocket(r->to);
-    free(r);
-    return 0;
-}
-
-/* ===== Public API ===== */
+/* ===== Legacy relay (removed — using IOCP) ===== */
 
 int nb_tcp_forward(
     SOCKET orig_sock,
@@ -291,6 +447,7 @@ int nb_tcp_forward(
     uint32_t pid, const char *proc_name)
 {
     if (!g_pool_initialized) nb_tcp_pool_init();
+    if (!g_iocp) nb_iocp_init();
 
     /* Get process name if not provided */
     char proc_name_buf[MAX_PROC_NAME] = "";
@@ -309,7 +466,7 @@ int nb_tcp_forward(
     SOCKET core_sock = nb_pool_acquire();
     if (core_sock == INVALID_SOCKET) return -1;
 
-    /* Build and send NetBridge Header */
+    /* Build NetBridge Header */
     uint8_t hdr_buf[128];
     uint32_t hdr_len = nb_tcp_header_serialize(
         hdr_buf, sizeof(hdr_buf),
@@ -317,28 +474,63 @@ int nb_tcp_forward(
         dst_addr, pid, nb_token_get(),
         proc_name, proc_name_len);
 
-    if (hdr_len == 0 ||
-        send(core_sock, (const char *)hdr_buf, (int)hdr_len, 0) != (int)hdr_len) {
+    if (hdr_len == 0) {
         closesocket(core_sock);
         return -1;
     }
 
-    /* Spawn bidirectional relay threads */
-    RelayArg *r1 = (RelayArg *)malloc(sizeof(RelayArg));
-    RelayArg *r2 = (RelayArg *)malloc(sizeof(RelayArg));
-    if (!r1 || !r2) {
-        free(r1); free(r2);
+    /* Read first data from orig_sock to enable scatter-gather send */
+    char *first_buf = (char *)nb_buf_acquire_pool(NB_POOL_LARGE);
+    if (!first_buf) {
+        send(core_sock, (const char *)hdr_buf, (int)hdr_len, 0);
         closesocket(core_sock);
         closesocket(orig_sock);
         return -1;
     }
-    r1->from = orig_sock; r1->to = core_sock;
-    r2->from = core_sock; r2->to = orig_sock;
 
-    HANDLE t1 = CreateThread(NULL, 0, relay_thread, r1, 0, NULL);
-    HANDLE t2 = CreateThread(NULL, 0, relay_thread, r2, 0, NULL);
-    if (t1) CloseHandle(t1);
-    if (t2) CloseHandle(t2);
+    /* Set non-blocking on orig_sock briefly to peek first data */
+    u_long mode = 1;
+    ioctlsocket(orig_sock, FIONBIO, &mode);
+    int first_len = recv(orig_sock, first_buf, NB_BUF_LARGE, MSG_PEEK);
+    mode = 0;
+    ioctlsocket(orig_sock, FIONBIO, &mode);
+
+    if (first_len <= 0) {
+        /* No data yet — send header only, relay will handle the rest */
+        nb_buf_release_pool(first_buf, NB_POOL_LARGE);
+        if (send(core_sock, (const char *)hdr_buf, (int)hdr_len, 0) != (int)hdr_len) {
+            closesocket(core_sock);
+            closesocket(orig_sock);
+            return -1;
+        }
+    } else {
+        /* Scatter-gather: header + first data in one syscall */
+        WSABUF bufs[2];
+        bufs[0].buf = (char *)hdr_buf;
+        bufs[0].len = hdr_len;
+        bufs[1].buf = first_buf;
+        bufs[1].len = first_len;
+
+        DWORD bytesSent = 0;
+        WSASend(core_sock, bufs, 2, &bytesSent, 0, NULL, NULL);
+
+        /* Actually consume the peeked data */
+        recv(orig_sock, first_buf, first_len, 0);
+        nb_buf_release_pool(first_buf, NB_POOL_LARGE);
+
+        if (bytesSent != hdr_len + (DWORD)first_len) {
+            closesocket(core_sock);
+            closesocket(orig_sock);
+            return -1;
+        }
+    }
+
+    /* Start IOCP relay — zero threads per connection */
+    if (nb_iocp_relay(orig_sock, core_sock) != 0) {
+        closesocket(core_sock);
+        closesocket(orig_sock);
+        return -1;
+    }
 
     return 0;
 }
