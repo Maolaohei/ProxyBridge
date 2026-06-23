@@ -4760,11 +4760,17 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     Sleep(200);
 
     snprintf(filter, sizeof(filter),
-        "((tcp or udp) and (outbound or loopback or port=%d or port=%d))",
+        "((tcp or udp) and (outbound or loopback or "
+        "tcp.DstPort == %d or tcp.SrcPort == %d or "
+        "udp.DstPort == %d or udp.SrcPort == %d)) or "
+        "(udp and not outbound and udp.SrcPort == 53)",
+        g_local_relay_port, g_local_relay_port,
         g_local_relay_port, g_local_relay_port);
 
     // Note: Added 'loopback' to filter to capture localhost (127.x.x.x) traffic
     // This enables proxying local connections for MITM scenarios
+    // NOTE: WinDivert 2.2.2 does NOT support the 'port=' shorthand keyword.
+    // Must use tcp.DstPort==/tcp.SrcPort==/udp.DstPort==/udp.SrcPort== instead.
     windivert_handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, priority, 0);
     if (windivert_handle == INVALID_HANDLE_VALUE)
     {
