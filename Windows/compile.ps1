@@ -4,7 +4,10 @@ param(
     [string]$Compiler = 'auto',
 
     [Parameter(Mandatory=$false)]
-    [switch]$NoSign
+    [switch]$NoSign,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$PGO
 )
 
 $WinDivertPath = "D:\UGit\v2rayN\v2rayN\WinDivert-2.2.2-A"
@@ -68,7 +71,7 @@ function Compile-MSVC {
     "$SourcePath\netbridge\nb_buf.c"
 )
 
-$clArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
+$clArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
               "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
               "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
               "/I`"$WinDivertPath\include`" " +
@@ -80,6 +83,11 @@ $clArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 "
               "/LIBPATH:`"$WinDivertPath\$Arch`" " +
               "WinDivert.lib ws2_32.lib iphlpapi.lib " +
               "/OUT:$OutputDLL"
+
+    if ($PGO) {
+        $clArgs += " /GENPROFILE"
+        Write-Host "  PGO: Instrumenting for profile collection" -ForegroundColor Yellow
+    }
 
     $cmd = "`"$vcvarsPath`" $Arch >nul && cl.exe $clArgs"
 
@@ -192,7 +200,7 @@ if ($Compiler -eq 'auto' -or $Compiler -eq 'msvc') {
         if ($vsPath) {
             $vcvarsPath = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
             if (Test-Path $vcvarsPath) {
-                $testClArgs = "/nologo /O2 /W4 /wd4100 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS " +
+                $testClArgs = "/nologo /std:c11 /O2 /W4 /wd4100 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS " +
                     "/I`"$WinDivertPath\include`" " +
                     "/I`"$SourcePath\include`" " +
                     "/I`"$SourcePath`" " +
@@ -246,6 +254,36 @@ if ($success) {
     Write-Host "`nMoving files to output directory..." -ForegroundColor Green
     Move-Item $OutputDLL -Destination $OutputDir -Force
     Write-Host "  Moved: $OutputDLL -> $OutputDir\" -ForegroundColor Gray
+
+    if ($PGO -and $Compiler -ne 'gcc') {
+        Write-Host "`nPGO: Rebuilding with profile data..." -ForegroundColor Green
+        $pgdFile = "$OutputDLL.pgd"
+        if (Test-Path $pgdFile) {
+            $pgoClArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
+                "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
+                "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
+                "/I`"$WinDivertPath\include`" " +
+                "/I`"$SourcePath\include`" " +
+                "/I`"$SourcePath`" " +
+                ($SourceFiles -join " ") +
+                " /LD " +
+                "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT " +
+                "/LIBPATH:`"$WinDivertPath\$Arch`" " +
+                "WinDivert.lib ws2_32.lib iphlpapi.lib " +
+                "/OUT:$OutputDLL /USEPROFILE"
+            $pgoCmd = "`"$vcvarsPath`" $Arch >nul && cl.exe $pgoClArgs"
+            $pgoResult = cmd /c $pgoCmd '2>&1'
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  PGO optimization complete" -ForegroundColor Green
+                Move-Item $OutputDLL -Destination $OutputDir -Force
+            } else {
+                Write-Host "  PGO rebuild failed, using instrumented binary" -ForegroundColor Yellow
+                Write-Host $pgoResult
+            }
+        } else {
+            Write-Host "  No .pgd profile data found, skipping PGO optimize" -ForegroundColor Yellow
+        }
+    }
 
     $files = @(
         "$WinDivertPath\$Arch\WinDivert.dll",
