@@ -5,6 +5,11 @@
 #include <string.h>
 #include <stddef.h>
 
+/* MSVC compatibility: _Static_assert is C11, MSVC uses static_assert */
+#if defined(_MSC_VER) && !defined(_Static_assert)
+#define _Static_assert(cond, msg) static_assert(cond, msg)
+#endif
+
 /*
  * NetBridge Protocol Definition (v2.1.0)
  *
