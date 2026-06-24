@@ -237,39 +237,50 @@ static void test_buf_pool(void)
     PASS();
 
     TEST("nb_buf_acquire_pool SMALL");
-    void *small = nb_buf_acquire_pool(NB_POOL_SMALL);
-    assert(small != NULL);
-    nb_buf_release_pool(small, NB_POOL_SMALL);
+    {
+        void *pSmall = nb_buf_acquire_pool(NB_POOL_SMALL);
+        assert(pSmall != NULL);
+        nb_buf_release_pool(pSmall, NB_POOL_SMALL);
+    }
     PASS();
 
     TEST("nb_buf_acquire_pool MEDIUM");
-    void *medium = nb_buf_acquire_pool(NB_POOL_MEDIUM);
-    assert(medium != NULL);
-    nb_buf_release_pool(medium, NB_POOL_MEDIUM);
+    {
+        void *medium = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+        assert(medium != NULL);
+        nb_buf_release_pool(medium, NB_POOL_MEDIUM);
+    }
     PASS();
 
     TEST("nb_buf_acquire_pool LARGE");
-    void *large = nb_buf_acquire_pool(NB_POOL_LARGE);
-    assert(large != NULL);
-    nb_buf_release_pool(large, NB_POOL_LARGE);
+    {
+        void *large = nb_buf_acquire_pool(NB_POOL_LARGE);
+        assert(large != NULL);
+        nb_buf_release_pool(large, NB_POOL_LARGE);
+    }
     PASS();
 
     TEST("nb_buf_pool reuse (acquire same buffer twice)");
-    void *b1 = nb_buf_acquire_pool(NB_POOL_MEDIUM);
-    nb_buf_release_pool(b1, NB_POOL_MEDIUM);
-    void *b2 = nb_buf_acquire_pool(NB_POOL_MEDIUM);
-    assert(b2 == b1); /* should reuse the same buffer */
-    nb_buf_release_pool(b2, NB_POOL_MEDIUM);
+    {
+        void *b1 = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+        nb_buf_release_pool(b1, NB_POOL_MEDIUM);
+        void *b2 = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+        assert(b2 == b1);
+        nb_buf_release_pool(b2, NB_POOL_MEDIUM);
+    }
     PASS();
 
     TEST("nb_buf_pool stress (64 concurrent)");
-    void *bufs[64];
-    for (int i = 0; i < 64; i++)
-        bufs[i] = nb_buf_acquire_pool(NB_POOL_MEDIUM);
-    for (int i = 0; i < 64; i++)
-        assert(bufs[i] != NULL);
-    for (int i = 0; i < 64; i++)
-        nb_buf_release_pool(bufs[i], NB_POOL_MEDIUM);
+    {
+        void *bufs[64];
+        int i;
+        for (i = 0; i < 64; i++)
+            bufs[i] = nb_buf_acquire_pool(NB_POOL_MEDIUM);
+        for (i = 0; i < 64; i++)
+            assert(bufs[i] != NULL);
+        for (i = 0; i < 64; i++)
+            nb_buf_release_pool(bufs[i], NB_POOL_MEDIUM);
+    }
     PASS();
 
     TEST("nb_buf_pool overflow (>64 drops excess)");
