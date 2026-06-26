@@ -61,7 +61,8 @@ void nb_tcp_pool_init(void)
     g_pool_initialized = TRUE;
 
     /* Pre-warm in background thread — don't block startup */
-    CreateThread(NULL, 0, nb_pool_warmup_thread, NULL, 0, NULL);
+    HANDLE h = CreateThread(NULL, 0, nb_pool_warmup_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
 }
 
 static DWORD WINAPI nb_pool_warmup_thread(LPVOID arg)
@@ -395,7 +396,8 @@ static void nb_iocp_init(void)
     if (!g_iocp) return;
 
     for (int i = 0; i < IOCP_WORKERS; i++) {
-        CreateThread(NULL, 0, iocp_worker, NULL, 0, NULL);
+        HANDLE h = CreateThread(NULL, 0, iocp_worker, NULL, 0, NULL);
+        if (h) CloseHandle(h);
     }
 }
 

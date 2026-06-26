@@ -2108,6 +2108,34 @@ static void dns_cache_init(void)
     memset(g_dns_cache_v6, 0, sizeof(g_dns_cache_v6));
 }
 
+static void dns_cache_free(void)
+{
+    AcquireSRWLockExclusive(&g_dns_cache_lock);
+    for (int i = 0; i < DNS_CACHE_BUCKETS; i++)
+    {
+        DNS_CACHE_ENTRY *e = g_dns_cache[i];
+        while (e)
+        {
+            DNS_CACHE_ENTRY *next = e->next;
+            free(e);
+            e = next;
+        }
+        g_dns_cache[i] = NULL;
+    }
+    for (int i = 0; i < DNS_CACHE_BUCKETS; i++)
+    {
+        DNS_CACHE_ENTRY_V6 *e = g_dns_cache_v6[i];
+        while (e)
+        {
+            DNS_CACHE_ENTRY_V6 *next = e->next;
+            free(e);
+            e = next;
+        }
+        g_dns_cache_v6[i] = NULL;
+    }
+    ReleaseSRWLockExclusive(&g_dns_cache_lock);
+}
+
 static UINT32 dns_bucket(UINT32 ip)
 {
     return (ip * 2654435761u) >> (32 - 10);  // Knuth multiplicative hash 1024 buckets
@@ -4905,7 +4933,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     {
         if (packet_thread[i] != NULL)
         {
-            WaitForSingleObject(packet_thread[i], 1000);  // 1 second timeout
+            WaitForSingleObject(packet_thread[i], 5000);  // 5 second timeout
             CloseHandle(packet_thread[i]);
             packet_thread[i] = NULL;
         }
@@ -4913,21 +4941,21 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 
     if (proxy_thread != NULL)
     {
-        WaitForSingleObject(proxy_thread, 1000);  // 1 second timeout
+        WaitForSingleObject(proxy_thread, 5000);  // 5 second timeout
         CloseHandle(proxy_thread);
         proxy_thread = NULL;
     }
 
     if (cleanup_thread != NULL)
     {
-        WaitForSingleObject(cleanup_thread, 1000);  // 1 second timeout
+        WaitForSingleObject(cleanup_thread, 5000);  // 5 second timeout
         CloseHandle(cleanup_thread);
         cleanup_thread = NULL;
     }
 
     if (udp_relay_thread != NULL)
     {
-        WaitForSingleObject(udp_relay_thread, 1000);  // 1 second timeout
+        WaitForSingleObject(udp_relay_thread, 5000);  // 5 second timeout
         CloseHandle(udp_relay_thread);
         udp_relay_thread = NULL;
     }
@@ -4942,12 +4970,16 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
             free(to_free);
         }
     }
+    memset(connection_hash_table, 0, sizeof(connection_hash_table));
     ReleaseSRWLockExclusive(&lock);
 
     // Clear logged connections list
     clear_logged_connections();
 
     clear_pid_cache();
+
+    // Free DNS cache entries to prevent memory leaks
+    dns_cache_free();
 
     // Reset per-port decision cache so stale entries don't carry over
     // if ProxyBridge is stopped and restarted with different rules.
