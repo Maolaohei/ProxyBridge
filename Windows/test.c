@@ -1,14 +1,20 @@
-#include "src/include/nb_proto.h"
-#include "src/security/nb_token.h"
-#include "src/process/nb_procname.h"
-#include "src/netbridge/nb_session.h"
-#include "src/netbridge/nb_tcp.h"
-#include "src/netbridge/nb_buf.h"
+﻿#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <assert.h>
+#include "src/include/nb_proto.h"
+#include "src/security/nb_token.h"
+#include "src/process/nb_procname.h"
+#include "src/process/nb_flow_decision.h"
+#include "src/netbridge/nb_session.h"
+#include "src/netbridge/nb_tcp.h"
+#include "src/netbridge/nb_buf.h"
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -209,7 +215,7 @@ static void test_session_init(void)
         nb_session_shutdown();
         PASS();
     } else {
-        printf("  (skipping socket tests — WSAStartup failed)\n");
+        printf("  (skipping socket tests 閳?WSAStartup failed)\n");
     }
 
     if (wsa_ok) WSACleanup();
@@ -320,6 +326,42 @@ static void test_buf_perf(void)
     PASS();
 }
 
+
+static void test_flow_decision_5tuple(void)
+{
+    TEST("flow decision init");
+    nb_flow_decision_init();
+    PASS();
+
+    TEST("flow v4 set/lookup DIRECT");
+    nb_flow_set_v4(0x0100007f, 12345, 0x08080808, 443, 6, NB_FLOW_DIRECT);
+    assert(nb_flow_lookup_v4(0x0100007f, 12345, 0x08080808, 443, 6) == NB_FLOW_DIRECT);
+    PASS();
+
+    TEST("flow v4 different 5-tuple is independent");
+    assert(nb_flow_lookup_v4(0x0100007f, 12345, 0x08080808, 80, 6) == NB_FLOW_NONE);
+    PASS();
+
+    TEST("flow v4 clear");
+    nb_flow_clear_v4(0x0100007f, 12345, 0x08080808, 443, 6);
+    assert(nb_flow_lookup_v4(0x0100007f, 12345, 0x08080808, 443, 6) == NB_FLOW_NONE);
+    PASS();
+
+    TEST("flow v6 set/lookup DIRECT");
+    {
+        UINT8 s6[16] = {0}; s6[15] = 1;
+        UINT8 d6[16] = {0}; d6[15] = 2;
+        nb_flow_set_v6(s6, 23456, d6, 443, 6, NB_FLOW_DIRECT);
+        assert(nb_flow_lookup_v6(s6, 23456, d6, 443, 6) == NB_FLOW_DIRECT);
+        assert(nb_flow_lookup_v6(s6, 23456, d6, 80, 6) == NB_FLOW_NONE);
+        nb_flow_clear_v6(s6, 23456, d6, 443, 6);
+        assert(nb_flow_lookup_v6(s6, 23456, d6, 443, 6) == NB_FLOW_NONE);
+    }
+    PASS();
+
+    nb_flow_decision_clear_all();
+}
+
 int main(void)
 {
     printf("=== NetBridge Unit Tests ===\n\n");
@@ -342,6 +384,9 @@ int main(void)
 
     printf("\n[TCP Pool]\n");
     test_tcp_pool_init();
+
+    printf("\n[Flow Decision]\n");
+    test_flow_decision_5tuple();
 
     nb_buf_shutdown();
 

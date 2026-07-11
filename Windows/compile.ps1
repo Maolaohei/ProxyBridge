@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$false)]
     [ValidateSet('msvc', 'gcc', 'auto')]
     [string]$Compiler = 'auto',
@@ -68,12 +68,13 @@ function Compile-MSVC {
     "$SourcePath\$SourceFile",
     "$SourcePath\security\nb_token.c",
     "$SourcePath\process\nb_procname.c",
-    "$SourcePath\process\nb_port_decision.c",
+    "$SourcePath\process\nb_flow_decision.c",
     "$SourcePath\process\nb_pid_table.c",
     "$SourcePath\netbridge\nb_tcp.c",
     "$SourcePath\netbridge\nb_session.c",
     "$SourcePath\netbridge\nb_buf.c",
-    "$SourcePath\netbridge\nb_worker_pool.c"
+    "$SourcePath\netbridge\nb_worker_pool.c",
+    "$SourcePath\netbridge\nb_iocp_relay.c"
 )
 
 
@@ -85,7 +86,7 @@ if ($PgoOptimize -and -not $PGO) {
     Write-Host "PGO optimize-only mode (/USEPROFILE)" -ForegroundColor Cyan
 }
 $clArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
-              "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
+              "/DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
               "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
               "/I`"$WinDivertPath\include`" " +
               "/I`"$SourcePath\include`" " +
@@ -129,12 +130,13 @@ function Compile-GCC {
         "$SourcePath\$SourceFile",
         "$SourcePath/security/nb_token.c",
         "$SourcePath/process/nb_procname.c",
-        "$SourcePath/process/nb_port_decision.c",
+        "$SourcePath/process/nb_flow_decision.c",
         "$SourcePath/process/nb_pid_table.c",
         "$SourcePath/netbridge/nb_tcp.c",
         "$SourcePath/netbridge/nb_session.c",
         "$SourcePath/netbridge/nb_buf.c",
-        "$SourcePath/netbridge/nb_worker_pool.c"
+        "$SourcePath/netbridge/nb_worker_pool.c",
+        "$SourcePath/netbridge/nb_iocp_relay.c"
     )
 
     $cmd = "gcc -shared -O2 -flto -s -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
@@ -185,10 +187,10 @@ function Sign-Binary {
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -eq 0) {
-        Write-Host "    ✓ Signed successfully" -ForegroundColor Green
+        Write-Host "    鉁?Signed successfully" -ForegroundColor Green
         return $true
     } else {
-        Write-Host "    ✗ Signing failed: $result" -ForegroundColor Red
+        Write-Host "    鉁?Signing failed: $result" -ForegroundColor Red
         return $false
     }
 }
@@ -198,18 +200,19 @@ function Sign-Binary {
 
 $success = $false
 
-# ── Build and run tests ────────────────────────────────────────────────────
+# 鈹€鈹€ Build and run tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 Write-Host "`nBuilding tests..." -ForegroundColor Green
 $TestFiles = @(
     "test.c",
     "$SourcePath/security/nb_token.c",
     "$SourcePath/process/nb_procname.c",
-    "$SourcePath/process/nb_port_decision.c",
+    "$SourcePath/process/nb_flow_decision.c",
     "$SourcePath/process/nb_pid_table.c",
     "$SourcePath/netbridge/nb_tcp.c",
     "$SourcePath/netbridge/nb_session.c",
     "$SourcePath/netbridge/nb_buf.c",
-    "$SourcePath/netbridge/nb_worker_pool.c"
+    "$SourcePath/netbridge/nb_worker_pool.c",
+    "$SourcePath/netbridge/nb_iocp_relay.c"
 )
 
 if ($Compiler -eq 'auto' -or $Compiler -eq 'msvc') {
@@ -219,7 +222,7 @@ if ($Compiler -eq 'auto' -or $Compiler -eq 'msvc') {
         if ($vsPath) {
             $vcvarsPath = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
             if (Test-Path $vcvarsPath) {
-                $testClArgs = "/nologo /std:c11 /O2 /W4 /wd4100 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS " +
+                $testClArgs = "/nologo /std:c11 /O2 /W4 /wd4100 /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS " +
                     "/I`"$WinDivertPath\include`" " +
                     "/I`"$SourcePath\include`" " +
                     "/I`"$SourcePath`" " +
@@ -279,7 +282,7 @@ if ($success) {
         $pgdFile = "$OutputDLL.pgd"
         if (Test-Path $pgdFile) {
             $pgoClArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
-                "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
+                "/DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
                 "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
                 "/I`"$WinDivertPath\include`" " +
                 "/I`"$SourcePath\include`" " +
@@ -350,7 +353,7 @@ if ($success) {
         Write-Host $publishResult
     }
 
-    # ── Build CLI ────────────────────────────────────────────────────────────
+    # 鈹€鈹€ Build CLI 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     Write-Host "`nBuilding CLI..." -ForegroundColor Green
     if ($script:foundVcvarsPath -and (Test-Path $script:foundVcvarsPath)) {
         $cliArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +

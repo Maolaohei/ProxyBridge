@@ -1,4 +1,4 @@
-#include <winsock2.h>
+﻿#include <winsock2.h>
 #include <windows.h>
 #include "ProxyBridge.h"
 #include <ws2tcpip.h>
@@ -22,9 +22,10 @@
 #include "include/nb_proto.h"
 #include "security/nb_token.h"
 #include "process/nb_procname.h"
-#include "process/nb_port_decision.h"
+#include "process/nb_flow_decision.h"
 #include "process/nb_pid_table.h"
 #include "netbridge/nb_worker_pool.h"
+#include "netbridge/nb_iocp_relay.h"
 #include "netbridge/nb_tcp.h"
 #include "netbridge/nb_session.h"
 #include "netbridge/nb_buf.h"
@@ -223,12 +224,26 @@ static SRWLOCK             g_dns_cache_lock;
 //
 // Thread safety: InterlockedOr/And for writes; plain aligned 32-bit read for
 // reads (x86/x64 aligned read is atomic; we only need visibility, not ordering).
-/* Port decision cache moved to process/nb_port_decision.c (TTL + invalidation). */
+/* Flow decision cache (5-tuple) with port-level compatibility wrappers. */
 static __forceinline BOOL port_is_decided(UINT16 p) { return nb_port_is_decided(p); }
 static __forceinline BOOL port_is_direct(UINT16 p)  { return nb_port_is_direct(p); }
 static __forceinline void port_set_direct(UINT16 p) { nb_port_set_direct(p); }
 static __forceinline void port_set_decided(UINT16 p){ nb_port_set_decided(p); }
 static __forceinline void port_clear(UINT16 p)      { nb_port_clear(p); }
+
+static __forceinline NbFlowDecision flow4(UINT32 sip, UINT16 sp, UINT32 dip, UINT16 dp, UINT8 proto)
+{ return nb_flow_lookup_v4(sip, sp, dip, dp, proto); }
+static __forceinline void flow4_set(UINT32 sip, UINT16 sp, UINT32 dip, UINT16 dp, UINT8 proto, NbFlowDecision d)
+{ nb_flow_set_v4(sip, sp, dip, dp, proto, d); }
+static __forceinline void flow4_clear(UINT32 sip, UINT16 sp, UINT32 dip, UINT16 dp, UINT8 proto)
+{ nb_flow_clear_v4(sip, sp, dip, dp, proto); }
+
+static __forceinline NbFlowDecision flow6(const UINT8 *sip, UINT16 sp, const UINT8 *dip, UINT16 dp, UINT8 proto)
+{ return nb_flow_lookup_v6(sip, sp, dip, dp, proto); }
+static __forceinline void flow6_set(const UINT8 *sip, UINT16 sp, const UINT8 *dip, UINT16 dp, UINT8 proto, NbFlowDecision d)
+{ nb_flow_set_v6(sip, sp, dip, dp, proto, d); }
+static __forceinline void flow6_clear(const UINT8 *sip, UINT16 sp, const UINT8 *dip, UINT16 dp, UINT8 proto)
+{ nb_flow_clear_v6(sip, sp, dip, dp, proto); }
 
 static UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
 static BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
@@ -405,7 +420,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             continue;
         }
 
-        /* ── Fast path: classify early drop ──────────────────────────
+        /* 闁冲厜鍋撻柍鍏夊亾 Fast path: classify early drop 闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾
          * Non-outbound packets that aren't relay port returns
          * don't need processing. Drop them immediately. */
         if (!addr.Outbound && packet_len >= 20)
@@ -445,11 +460,11 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             }
         }
 
-        /* ── Fast path: port bitmap skip ──────────────────────────────
+        /* 闁冲厜鍋撻柍鍏夊亾 Fast path: port bitmap skip 闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾
          * If both src and dst ports are already decided as DIRECT,
          * skip the expensive ParsePacket + rule matching entirely.
          * This eliminates 50-90% of packets from full processing.
-         * Only works for IPv4 TCP/UDP (IPv6 falls through to full parse). */
+         * IPv4/IPv6 TCP/UDP with 5-tuple flow cache (IPv6 assumes no ext headers). */
         if (packet_len >= 20)
         {
             UINT8 ip_ver = (packet[0] >> 4) & 0xF;
@@ -461,7 +476,17 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + ihl));
                     UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));
-                    if (port_is_decided(sp) && port_is_direct(sp) &&
+                    UINT32 sip = *(UINT32*)(packet + 12);
+                    UINT32 dip = *(UINT32*)(packet + 16);
+                    NbFlowDecision fd = flow4(sip, sp, dip, dp, proto);
+                    if (fd == NB_FLOW_DIRECT)
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                    /* Fallback: legacy port bitmap still helps when only src-port known */
+                    if (fd == NB_FLOW_NONE &&
+                        port_is_decided(sp) && port_is_direct(sp) &&
                         port_is_decided(dp) && port_is_direct(dp))
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
@@ -478,7 +503,17 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + 40));
                     UINT16 dp = ntohs(*(UINT16*)(packet + 42));
-                    if (port_is_decided(sp) && port_is_direct(sp) &&
+                    const UINT8 *sip6 = packet + 8;
+                    const UINT8 *dip6 = packet + 24;
+                    NbFlowDecision fd6 = flow6(sip6, sp, dip6, dp, proto);
+                    if (fd6 == NB_FLOW_DIRECT)
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                    /* Fallback: legacy port path when only src-port decision known */
+                    if (fd6 == NB_FLOW_NONE &&
+                        port_is_decided(sp) && port_is_direct(sp) &&
                         port_is_decided(dp) && port_is_direct(dp))
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
@@ -598,7 +633,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                         PROXY_CONFIG *pc6u = find_proxy_config(pcid6u);
                         if (pc6u == NULL || pc6u->type != PROXY_TYPE_SOCKS5)
                         {
-                            // HTTP proxy can't relay UDP — drop
+                            // HTTP proxy can't relay UDP 闁?drop
                             continue;
                         }
                         add_connection_v6(sp, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, pcid6u);
@@ -650,6 +685,19 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             {
                 UINT16 sp = ntohs(tcp_header->SrcPort);
                 UINT16 dp = ntohs(tcp_header->DstPort);
+
+                {
+                    NbFlowDecision f6 = flow6((const UINT8*)ipv6_header->SrcAddr, sp,
+                                              (const UINT8*)ipv6_header->DstAddr, dp, 6);
+                    if (tcp_header->Fin || tcp_header->Rst) {
+                        flow6_clear((const UINT8*)ipv6_header->SrcAddr, sp,
+                                    (const UINT8*)ipv6_header->DstAddr, dp, 6);
+                        port_clear(sp);
+                    } else if (f6 == NB_FLOW_DIRECT) {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
 
                 if (port_is_decided(sp))
                 {
@@ -723,7 +771,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 UINT32 proxy_config_id6 = 0;
                 action6 = check_process_rule_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, FALSE, &pid6, &proxy_config_id6);
 
-                // ::1 IPv6 loopback — use  same "Localhost via Proxy" toggle as IPv4 127.
+                // ::1 IPv6 loopback 闁?use  same "Localhost via Proxy" toggle as IPv4 127.
                 if (action6 == RULE_ACTION_PROXY && !g_localhost_via_proxy)
                 {
                     const UINT8 *dst6 = (const UINT8*)ipv6_header->DstAddr;
@@ -774,18 +822,21 @@ static DWORD WINAPI packet_processor(LPVOID arg)
 
                 if (action6 == RULE_ACTION_DIRECT)
                 {
+                    nb_flow_set_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, 6, NB_FLOW_DIRECT);
                     port_set_direct(sp);
                     WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                     continue;
                 }
                 else if (action6 == RULE_ACTION_BLOCK)
                 {
+                    nb_flow_set_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, 6, NB_FLOW_DECIDED);
                     port_set_decided(sp);
                     continue;
                 }
                 else if (action6 == RULE_ACTION_PROXY)
                 {
                     add_connection_v6(sp, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, proxy_config_id6);
+                    nb_flow_set_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, 6, NB_FLOW_DECIDED);
                     port_set_decided(sp);
                     tcp_header->DstPort = htons(g_local_relay_port);
 
@@ -800,7 +851,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                         memcpy(ipv6_header->SrcAddr, tmp, 16);
                         addr.Outbound = FALSE;
                     }
-                    // loopback (::1→::1): just changed DstPort, keep Outbound=TRUE
+                    // loopback (::1闁?:1): just changed DstPort, keep Outbound=TRUE
                     goto ipv6_send;
                 }
             }
@@ -960,7 +1011,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             {
                 if (udp_header->DstPort != htons(LOCAL_UDP_RELAY_PORT))
                 {
-                    // Snoop DNS responses to build the IP→hostname cache used by
+                    // Snoop DNS responses to build the IP闁愁偅濮峯stname cache used by
                     // socks5_connect_domain() so that SOCKS5 proxies receive the
                     // original hostname instead of a bare IP (issue #138).
                     if (ntohs(udp_header->SrcPort) == 53)
@@ -997,8 +1048,10 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 UINT16 sp = ntohs(tcp_header->SrcPort);
                 if (port_is_decided(sp))
                 {
-                    if (tcp_header->Fin || tcp_header->Rst)
+                    if (tcp_header->Fin || tcp_header->Rst) {
                         port_clear(sp);
+                        if (ip_header) flow4_clear(ip_header->SrcAddr, sp, ip_header->DstAddr, ntohs(tcp_header->DstPort), 6);
+                    }
                     if (port_is_direct(sp))
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
@@ -1134,8 +1187,8 @@ static DWORD WINAPI packet_processor(LPVOID arg)
 
                 if (action == RULE_ACTION_DIRECT)
                 {
-                    // Cache this decision so all subsequent packets from this port
-                    // fast-path at the top of the outbound branch (zero kernel calls).
+                    // Cache 5-tuple decision (and port compatibility).
+                    flow4_set(src_ip, src_port, orig_dest_ip, orig_dest_port, 6, NB_FLOW_DIRECT);
                     port_set_direct(src_port);
                     // Unmodified packet no checksum needed
                     WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
@@ -1143,6 +1196,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 }
                 else if (action == RULE_ACTION_BLOCK)
                 {
+                    flow4_set(src_ip, src_port, orig_dest_ip, orig_dest_port, 6, NB_FLOW_DECIDED);
                     port_set_decided(src_port);  // mark decided (not direct) so we don't re-run rule check
                     // Drop the packet - don't send it anywhere
                     continue;
@@ -1150,6 +1204,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 else if (action == RULE_ACTION_PROXY)
             {
                 add_connection(src_port, src_ip, orig_dest_ip, orig_dest_port, proxy_config_id);
+                flow4_set(src_ip, src_port, orig_dest_ip, orig_dest_port, 6, NB_FLOW_DECIDED);
                 // Mark this port as decided (not direct) so subsequent packets from
                 // the same source port skip the rule check.  The is_connection_tracked
                 // branch above handles the actual per-packet redirect.
@@ -1290,9 +1345,9 @@ static BOOL is_ipv6_multicast_or_linklocal(const UINT8 ip6[16])
     if (ip6[0] == 0xFF) return TRUE;
     // Link-local: FE80::/10  (equivalent to IPv4 APIPA 169.254.0.0/16)
     if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0x80) return TRUE;
-    // Site-local (deprecated RFC 3879): FEC0::/10 — still seen on old equipment
+    // Site-local (deprecated RFC 3879): FEC0::/10 闁?still seen on old equipment
     if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0xC0) return TRUE;
-    // Unspecified address: :: (all-zeros) — equivalent to IPv4 0.0.0.0
+    // Unspecified address: :: (all-zeros) 闁?equivalent to IPv4 0.0.0.0
     {
         static const UINT8 unspec[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
         if (memcmp(ip6, unspec, 16) == 0) return TRUE;
@@ -1808,7 +1863,7 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
     return RULE_ACTION_DIRECT;
 }
 
-// IPv6 variant of match_rule — uses match_ip_list_v6 for host patterns.
+// IPv6 variant of match_rule 闁?uses match_ip_list_v6 for host patterns.
 // Supports exact addresses ("::1"), CIDR ("2001:db8::/32"), and wildcards ("*").
 // IPv4-format patterns in target_hosts are silently skipped for IPv6 traffic.
 static RuleAction match_rule_v6(const char *process_name, const UINT8 dest_ip6[16], UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id)
@@ -2163,7 +2218,7 @@ static BOOL dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst
 }
 
 // Snoop an inbound DNS response (UDP payload starting at the DNS header).
-// For every A-record answer, store ip → qname in the DNS cache.
+// For every A-record answer, store ip 闁?qname in the DNS cache.
 static void snoop_dns_response(const UINT8 *payload, int payload_len)
 {
     if (payload_len < 12) return;
@@ -2218,7 +2273,7 @@ static void snoop_dns_response(const UINT8 *payload, int payload_len)
     }
 }
 
-// ── SOCKS5 CONNECT with ATYP_DOMAIN ──────────────────────────────────────────
+// 闁冲厜鍋撻柍鍏夊亾 SOCKS5 CONNECT with ATYP_DOMAIN 闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾
 
 static int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, const PROXY_CONFIG *cfg)
 {
@@ -3395,13 +3450,13 @@ static DWORD WINAPI connection_handler(LPVOID arg)
     }
 
     // 4 MB kernel socket buffers for the relay sockets.
-    // The upload path writes from client→proxy over a real network with non-zero
+    // The upload path writes from client闁愁偅濮玶oxy over a real network with non-zero
     // RTT; a small (512 KB) send buffer causes send_all() to block the moment
     // the proxy's receive window fills up, which stalls the relay loop and
-    // triggers TCP flow-control on the client side → massive upload throughput
+    // triggers TCP flow-control on the client side 闁?massive upload throughput
     // loss.  4 MB gives plenty of headroom even at high bitrates / high RTT.
-    configure_tcp_socket(socks_sock, 4194304, 30000);  // 4 MB – proxy connection
-    configure_tcp_socket(client_sock, 4194304, 30000); // 4 MB – app connection
+    configure_tcp_socket(socks_sock, 4194304, 30000);  // 4 MB 闁?proxy connection
+    configure_tcp_socket(client_sock, 4194304, 30000); // 4 MB 闁?app connection
 
     memset(&socks_addr, 0, sizeof(socks_addr));
     socks_addr.sin_family = AF_INET;
@@ -3519,8 +3574,8 @@ static DWORD WINAPI one_way_relay(LPVOID arg)
     return 0;
 }
 
-// Bidirectional relay: spawns one thread for upload (client→proxy) and runs
-// the download (proxy→client) direction in the calling thread.  Blocks until
+// Bidirectional relay: spawns one thread for upload (client闁愁偅濮玶oxy) and runs
+// the download (proxy闁愁偅濡絣ient) direction in the calling thread.  Blocks until
 // both directions have finished so the caller (connection_handler) can return
 // cleanly and its thread handle can be closed.
 static DWORD WINAPI transfer_handler(LPVOID arg)
@@ -3530,54 +3585,45 @@ static DWORD WINAPI transfer_handler(LPVOID arg)
     SOCKET sock_proxy  = config->to_socket;
     free(config);
 
-    RELAY_PAIR *pair = (RELAY_PAIR *)malloc(sizeof(RELAY_PAIR));
-    if (!pair)
+    /* Full IOCP bidirectional relay 闁?zero dedicated threads per connection. */
+    if (nb_iocp_relay_start(sock_client, sock_proxy) != 0)
     {
-        closesocket(sock_client);
-        closesocket(sock_proxy);
-        return 1;
-    }
-    pair->sock_client = sock_client;
-    pair->sock_proxy  = sock_proxy;
-    pair->refs        = 2;
+        /* Fallback to classic one-way threads if IOCP init/start fails. */
+        RELAY_PAIR *pair = (RELAY_PAIR *)malloc(sizeof(RELAY_PAIR));
+        if (!pair)
+        {
+            closesocket(sock_client);
+            closesocket(sock_proxy);
+            return 1;
+        }
+        pair->sock_client = sock_client;
+        pair->sock_proxy  = sock_proxy;
+        pair->refs        = 2;
 
-    // Upload: client → proxy  (dedicated thread — may block on slow proxy send)
-    ONE_WAY_CONFIG *up = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
-    // Download: proxy → client (runs in this thread — loopback, rarely blocks)
-    ONE_WAY_CONFIG *dn = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
-
-    if (!up || !dn)
-    {
-        free(up);
-        free(dn);
-        free(pair);
-        closesocket(sock_client);
-        closesocket(sock_proxy);
-        return 1;
-    }
-
-    up->pair = pair;  up->from = sock_client;  up->to = sock_proxy;
-    dn->pair = pair;  dn->from = sock_proxy;   dn->to = sock_client;
-
-    // Spawn the upload relay in its own thread.
-    HANDLE upload_thread = CreateThread(NULL, 0, one_way_relay, up, 0, NULL); /* keep dedicated for peer-wait */
-    if (!upload_thread)
-    {
-        free(up);
-        free(dn);
-        free(pair);
-        closesocket(sock_client);
-        closesocket(sock_proxy);
-        return 1;
+        ONE_WAY_CONFIG *up = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
+        ONE_WAY_CONFIG *dn = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
+        if (!up || !dn)
+        {
+            free(up); free(dn); free(pair);
+            closesocket(sock_client); closesocket(sock_proxy);
+            return 1;
+        }
+        up->pair = pair; up->from = sock_client; up->to = sock_proxy;
+        dn->pair = pair; dn->from = sock_proxy;  dn->to = sock_client;
+        HANDLE upload_thread = CreateThread(NULL, 0, one_way_relay, up, 0, NULL);
+        if (!upload_thread)
+        {
+            free(up); free(dn); free(pair);
+            closesocket(sock_client); closesocket(sock_proxy);
+            return 1;
+        }
+        one_way_relay(dn);
+        WaitForSingleObject(upload_thread, INFINITE);
+        CloseHandle(upload_thread);
+        return 0;
     }
 
-    // Run the download relay in this thread (blocks until done).
-    one_way_relay(dn);
-
-    // Wait for the upload relay thread to finish, then clean up its handle.
-    WaitForSingleObject(upload_thread, INFINITE);
-    CloseHandle(upload_thread);
-
+    /* Ownership transferred to IOCP; connection_handler can return immediately. */
     return 0;
 }
 
@@ -4565,7 +4611,7 @@ static DWORD WINAPI cleanup_worker(LPVOID arg)
         if (running)
         {
             cleanup_stale_connections();
-            nb_port_decision_expire();
+            nb_flow_decision_expire();
         }
     }
     return 0;
@@ -4596,9 +4642,10 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 
     InitializeSRWLock(&lock);
     dns_cache_init();
-    nb_port_decision_init();
+    nb_flow_decision_init();
     nb_pid_table_init();
     nb_worker_pool_init(8);
+    nb_iocp_relay_init();
 
 #if NB_USE_NETBRIDGE
     nb_procname_init();
@@ -4613,7 +4660,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 #endif
 
     running = TRUE;
-    nb_port_decision_clear_all();
+    nb_flow_decision_clear_all();
 
     proxy_thread = CreateThread(NULL, 1, local_proxy_server, NULL, 0, NULL);
     if (proxy_thread == NULL)
@@ -4709,17 +4756,17 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         return FALSE;
     }
 
-    // WINDIVERT_PARAM_QUEUE_LENGTH: max packets in queue (range 32–16384).
+    // WINDIVERT_PARAM_QUEUE_LENGTH: max packets in queue (range 32闁?6384).
     // Under heavy upload the kernel enqueues bursts of outbound packets faster
     // than the 4 packet threads can drain them; a full queue drops arriving
-    // packets → TCP sees loss → retransmit + congestion-window halving.
+    // packets 闁?TCP sees loss 闁?retransmit + congestion-window halving.
     WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
     // WINDIVERT_PARAM_QUEUE_TIME: ms a packet waits before being dropped
-    // (range 100–16000, default 2000).  The old value of 8 ms was below the
+    // (range 100闁?6000, default 2000).  The old value of 8 ms was below the
     // minimum (100 ms) and caused aggressive packet drops under any sustained
     // upload load, directly producing the 40-60% upload throughput loss.
     WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_TIME, 2000);
-    // WINDIVERT_PARAM_QUEUE_SIZE: max total bytes in queue (range 65535–33553920).
+    // WINDIVERT_PARAM_QUEUE_SIZE: max total bytes in queue (range 65535闁?3553920).
     // Raise to the maximum so a burst of large packets never hits a byte cap.
     WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_SIZE, 33553920);
 
@@ -4792,11 +4839,12 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
         windivert_handle = INVALID_HANDLE_VALUE;
     }
 
-#if NB_USE_NETBRIDGE
-    nb_session_shutdown();
+    nb_iocp_relay_shutdown();
     nb_worker_pool_shutdown();
     nb_pid_table_shutdown();
-    nb_port_decision_clear_all();
+    nb_flow_decision_clear_all();
+#if NB_USE_NETBRIDGE
+    nb_session_shutdown();
     nb_tcp_pool_shutdown();
     nb_buf_shutdown();
     nb_procname_clear();
@@ -4857,7 +4905,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 
     // Reset per-port decision cache so stale entries don't carry over
     // if ProxyBridge is stopped and restarted with different rules.
-    nb_port_decision_clear_all();
+    nb_flow_decision_clear_all();
 
 
     log_message("ProxyBridge stopped");
@@ -4905,7 +4953,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_GetConnectionCount(void)
 PROXYBRIDGE_API UINT32 ProxyBridge_GetSessionCount(void)
 {
 #if NB_USE_NETBRIDGE
-    /* UDP sessions are managed by nb_session.c — return 0 for now */
+    /* UDP sessions are managed by nb_session.c 闁?return 0 for now */
     return 0;
 #else
     return 0;

@@ -3,6 +3,7 @@
 #include "../security/nb_token.h"
 #include "../process/nb_procname.h"
 #include "nb_buf.h"
+#include "nb_iocp_relay.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
@@ -51,6 +52,7 @@ static DWORD WINAPI nb_pool_warmup_thread(LPVOID arg);
 
 void nb_tcp_pool_init(void)
 {
+    nb_iocp_relay_init();
     if (g_pool_initialized) return;
     for (int i = 0; i < POOL_SIZE; i++) {
         g_pool[i].sock = INVALID_SOCKET;
@@ -228,6 +230,7 @@ void nb_tcp_pool_cleanup(void)
 
 void nb_tcp_pool_shutdown(void)
 {
+    nb_iocp_relay_shutdown();
     if (!g_pool_initialized) return;
     AcquireSRWLockExclusive(&g_pool_lock);
     for (int i = 0; i < POOL_SIZE; i++) {
@@ -242,205 +245,17 @@ void nb_tcp_pool_shutdown(void)
     ReleaseSRWLockExclusive(&g_pool_lock);
 }
 
-/* ===== IOCP Relay ===== */
+/* ===== IOCP Relay (shared module) ===== */
 
-#define IOCP_BUF_SIZE  65536
-#define IOCP_WORKERS   8
-#define IOCP_MAX_CONNS 1024
-
-/* IOCP operation types */
-#define IOCP_OP_RECV_ORIG  1
-#define IOCP_OP_SEND_CORE  2
-#define IOCP_OP_RECV_CORE  3
-#define IOCP_OP_SEND_ORIG  4
-
-typedef struct _IOCP_CONN {
-    OVERLAPPED ov_orig_recv;
-    OVERLAPPED ov_orig_send;
-    OVERLAPPED ov_core_recv;
-    OVERLAPPED ov_core_send;
-    WSABUF buf_orig_recv;
-    WSABUF buf_orig_send;
-    WSABUF buf_core_recv;
-    WSABUF buf_core_send;
-    char data_orig_recv[IOCP_BUF_SIZE];
-    char data_orig_send[IOCP_BUF_SIZE];
-    char data_core_recv[IOCP_BUF_SIZE];
-    char data_core_send[IOCP_BUF_SIZE];
-    SOCKET orig_sock;
-    SOCKET core_sock;
-    volatile LONG active;     /* 1 = active, 0 = closing */
-    volatile LONG refcount;   /* prevent double-free */
-} IOCP_CONN;
-
-static HANDLE g_iocp = NULL;
-static volatile LONG g_active_conns = 0;
-
-static IOCP_CONN* iocp_conn_alloc(void)
-{
-    IOCP_CONN *c = (IOCP_CONN *)calloc(1, sizeof(IOCP_CONN));
-    if (!c) return NULL;
-    c->orig_sock = INVALID_SOCKET;
-    c->core_sock = INVALID_SOCKET;
-    c->active = 1;
-    InterlockedExchange(&c->refcount, 2); /* 2 sockets */
-
-    c->buf_orig_recv.buf = c->data_orig_recv;
-    c->buf_orig_recv.len = IOCP_BUF_SIZE;
-    c->buf_orig_send.buf = c->data_orig_send;
-    c->buf_orig_send.len = IOCP_BUF_SIZE;
-    c->buf_core_recv.buf = c->data_core_recv;
-    c->buf_core_recv.len = IOCP_BUF_SIZE;
-    c->buf_core_send.buf = c->data_core_send;
-    c->buf_core_send.len = IOCP_BUF_SIZE;
-
-    InterlockedIncrement(&g_active_conns);
-    return c;
-}
-
-static void iocp_conn_release(IOCP_CONN *c)
-{
-    if (!c) return;
-    if (InterlockedDecrement(&c->refcount) == 0) {
-        if (c->orig_sock != INVALID_SOCKET) closesocket(c->orig_sock);
-        if (c->core_sock != INVALID_SOCKET) closesocket(c->core_sock);
-        InterlockedDecrement(&g_active_conns);
-        free(c);
-    }
-}
-
-/* Post async recv */
-static BOOL iocp_post_recv(SOCKET sock, OVERLAPPED *ov, WSABUF *buf)
-{
-    memset(ov, 0, sizeof(OVERLAPPED));
-    DWORD flags = 0;
-    DWORD bytesRecvd = 0;
-    int rc = WSARecv(sock, buf, 1, &bytesRecvd, &flags, ov, NULL);
-    return (rc == 0 || WSAGetLastError() == WSA_IO_PENDING);
-}
-
-/* Post async send */
-static BOOL iocp_post_send(SOCKET sock, OVERLAPPED *ov, WSABUF *buf)
-{
-    memset(ov, 0, sizeof(OVERLAPPED));
-    DWORD bytesSent = 0;
-    int rc = WSASend(sock, buf, 1, &bytesSent, 0, ov, NULL);
-    return (rc == 0 || WSAGetLastError() == WSA_IO_PENDING);
-}
-
-/* Worker thread — processes IOCP completions */
-static DWORD WINAPI iocp_worker(LPVOID arg)
-{
-    (void)arg;
-    DWORD bytes;
-    ULONG_PTR key;
-    OVERLAPPED *ov;
-
-    while (GetQueuedCompletionStatus(g_iocp, &bytes, &key, &ov, INFINITE))
-    {
-        if (!ov) continue; /* Shutdown signal */
-
-        IOCP_CONN *conn = (IOCP_CONN *)key;
-        if (!conn->active || bytes == 0) {
-            iocp_conn_release(conn);
-            continue;
-        }
-
-        /* Determine which operation completed by comparing ov pointer */
-        if (ov == &conn->ov_orig_recv) {
-            /* Recv from orig → send to core */
-            conn->buf_core_send.buf = conn->data_orig_recv;
-            conn->buf_core_send.len = bytes;
-            if (!iocp_post_send(conn->core_sock, &conn->ov_core_send, &conn->buf_core_send)) {
-                conn->active = 0;
-                iocp_conn_release(conn);
-            }
-        }
-        else if (ov == &conn->ov_core_send) {
-            /* Send to core done → recv more from orig */
-            conn->buf_orig_recv.buf = conn->data_orig_recv;
-            conn->buf_orig_recv.len = IOCP_BUF_SIZE;
-            if (!iocp_post_recv(conn->orig_sock, &conn->ov_orig_recv, &conn->buf_orig_recv)) {
-                conn->active = 0;
-                iocp_conn_release(conn);
-            }
-        }
-        else if (ov == &conn->ov_core_recv) {
-            /* Recv from core → send to orig */
-            conn->buf_orig_send.buf = conn->data_core_recv;
-            conn->buf_orig_send.len = bytes;
-            if (!iocp_post_send(conn->orig_sock, &conn->ov_orig_send, &conn->buf_orig_send)) {
-                conn->active = 0;
-                iocp_conn_release(conn);
-            }
-        }
-        else if (ov == &conn->ov_orig_send) {
-            /* Send to orig done → recv more from core */
-            conn->buf_core_recv.buf = conn->data_core_recv;
-            conn->buf_core_recv.len = IOCP_BUF_SIZE;
-            if (!iocp_post_recv(conn->core_sock, &conn->ov_core_recv, &conn->buf_core_recv)) {
-                conn->active = 0;
-                iocp_conn_release(conn);
-            }
-        }
-    }
-    return 0;
-}
-
-/* Initialize IOCP subsystem — call once */
 static void nb_iocp_init(void)
 {
-    if (g_iocp) return;
-
-    g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, IOCP_WORKERS);
-    if (!g_iocp) return;
-
-    for (int i = 0; i < IOCP_WORKERS; i++) {
-        HANDLE h = CreateThread(NULL, 0, iocp_worker, NULL, 0, NULL);
-        if (h) CloseHandle(h);
-    }
+    nb_iocp_relay_init();
 }
 
-/* Start IOCP relay for a connection pair */
 static int nb_iocp_relay(SOCKET orig_sock, SOCKET core_sock)
 {
-    if (!g_iocp) nb_iocp_init();
-    if (!g_iocp) return -1;
-
-    IOCP_CONN *conn = iocp_conn_alloc();
-    if (!conn) return -1;
-
-    conn->orig_sock = orig_sock;
-    conn->core_sock = core_sock;
-
-    /* Associate both sockets with IOCP */
-    CreateIoCompletionPort((HANDLE)orig_sock, g_iocp, (ULONG_PTR)conn, 0);
-    CreateIoCompletionPort((HANDLE)core_sock, g_iocp, (ULONG_PTR)conn, 0);
-
-    /* Post initial recv from orig */
-    if (!iocp_post_recv(orig_sock, &conn->ov_orig_recv, &conn->buf_orig_recv)) {
-        conn->active = 0;
-        iocp_conn_release(conn);
-        return -1;
-    }
-
-    /* Post initial recv from core */
-    if (!iocp_post_recv(core_sock, &conn->ov_core_recv, &conn->buf_core_recv)) {
-        conn->active = 0;
-        iocp_conn_release(conn);
-        return -1;
-    }
-
-    return 0;
+    return nb_iocp_relay_start(orig_sock, core_sock);
 }
-
-/* ===== Legacy relay (fallback) ===== */
-
-typedef struct {
-    SOCKET from;
-    SOCKET to;
-} RelayArg;
-
 /* ===== Legacy relay (removed — using IOCP) ===== */
 
 int nb_tcp_forward(
@@ -450,7 +265,7 @@ int nb_tcp_forward(
     uint32_t pid, const char *proc_name)
 {
     if (!g_pool_initialized) nb_tcp_pool_init();
-    if (!g_iocp) nb_iocp_init();
+    nb_iocp_init();
 
     /* Get process name if not provided */
     char proc_name_buf[MAX_PROC_NAME] = "";
