@@ -7,7 +7,9 @@ param(
     [switch]$NoSign,
 
     [Parameter(Mandatory=$false)]
-    [switch]$PGO
+    [switch]$PGO,
+    [Parameter(Mandatory=$false)]
+    [switch]$PgoOptimize
 )
 
 $WinDivertPath = "D:\UGit\v2rayN\v2rayN\WinDivert-2.2.2-A"
@@ -66,11 +68,22 @@ function Compile-MSVC {
     "$SourcePath\$SourceFile",
     "$SourcePath\security\nb_token.c",
     "$SourcePath\process\nb_procname.c",
+    "$SourcePath\process\nb_port_decision.c",
+    "$SourcePath\process\nb_pid_table.c",
     "$SourcePath\netbridge\nb_tcp.c",
     "$SourcePath\netbridge\nb_session.c",
-    "$SourcePath\netbridge\nb_buf.c"
+    "$SourcePath\netbridge\nb_buf.c",
+    "$SourcePath\netbridge\nb_worker_pool.c"
 )
 
+
+# PGO release recipe:
+#   1) .\compile.ps1 -PGO          # instrumented build
+#   2) run typical hijack workloads to produce .pgd/.pgc
+#   3) .\compile.ps1 -PgoOptimize  # rebuild with /USEPROFILE
+if ($PgoOptimize -and -not $PGO) {
+    Write-Host "PGO optimize-only mode (/USEPROFILE)" -ForegroundColor Cyan
+}
 $clArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
               "/D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
               "/arch:SSE2 /fp:fast /GS /guard:cf /Qpar " +
@@ -84,7 +97,7 @@ $clArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 
               "WinDivert.lib ws2_32.lib iphlpapi.lib " +
               "/OUT:$OutputDLL"
 
-    if ($PGO) {
+    if ($PGO -and -not $PgoOptimize) {
         $clArgs += " /GENPROFILE"
         Write-Host "  PGO: Instrumenting for profile collection" -ForegroundColor Yellow
     }
@@ -116,9 +129,12 @@ function Compile-GCC {
         "$SourcePath\$SourceFile",
         "$SourcePath/security/nb_token.c",
         "$SourcePath/process/nb_procname.c",
+        "$SourcePath/process/nb_port_decision.c",
+        "$SourcePath/process/nb_pid_table.c",
         "$SourcePath/netbridge/nb_tcp.c",
         "$SourcePath/netbridge/nb_session.c",
-        "$SourcePath/netbridge/nb_buf.c"
+        "$SourcePath/netbridge/nb_buf.c",
+        "$SourcePath/netbridge/nb_worker_pool.c"
     )
 
     $cmd = "gcc -shared -O2 -flto -s -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
@@ -188,9 +204,12 @@ $TestFiles = @(
     "test.c",
     "$SourcePath/security/nb_token.c",
     "$SourcePath/process/nb_procname.c",
+    "$SourcePath/process/nb_port_decision.c",
+    "$SourcePath/process/nb_pid_table.c",
     "$SourcePath/netbridge/nb_tcp.c",
     "$SourcePath/netbridge/nb_session.c",
-    "$SourcePath/netbridge/nb_buf.c"
+    "$SourcePath/netbridge/nb_buf.c",
+    "$SourcePath/netbridge/nb_worker_pool.c"
 )
 
 if ($Compiler -eq 'auto' -or $Compiler -eq 'msvc') {
@@ -255,7 +274,7 @@ if ($success) {
     Move-Item $OutputDLL -Destination $OutputDir -Force
     Write-Host "  Moved: $OutputDLL -> $OutputDir\" -ForegroundColor Gray
 
-    if ($PGO -and $Compiler -ne 'gcc') {
+    if (($PGO -or $PgoOptimize) -and $Compiler -ne 'gcc') {
         Write-Host "`nPGO: Rebuilding with profile data..." -ForegroundColor Green
         $pgdFile = "$OutputDLL.pgd"
         if (Test-Path $pgdFile) {

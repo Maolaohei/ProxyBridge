@@ -22,6 +22,9 @@
 #include "include/nb_proto.h"
 #include "security/nb_token.h"
 #include "process/nb_procname.h"
+#include "process/nb_port_decision.h"
+#include "process/nb_pid_table.h"
+#include "netbridge/nb_worker_pool.h"
 #include "netbridge/nb_tcp.h"
 #include "netbridge/nb_session.h"
 #include "netbridge/nb_buf.h"
@@ -220,32 +223,12 @@ static SRWLOCK             g_dns_cache_lock;
 //
 // Thread safety: InterlockedOr/And for writes; plain aligned 32-bit read for
 // reads (x86/x64 aligned read is atomic; we only need visibility, not ordering).
-static volatile LONG port_decided_bitmap[2048] = {0};  // 8 KB
-static volatile LONG port_direct_bitmap[2048]  = {0};  // 8 KB
-
-static __forceinline BOOL port_is_decided(UINT16 p)
-{
-    return (port_decided_bitmap[p >> 5] >> (p & 31)) & 1;
-}
-static __forceinline BOOL port_is_direct(UINT16 p)
-{
-    return (port_direct_bitmap[p >> 5] >> (p & 31)) & 1;
-}
-static __forceinline void port_set_direct(UINT16 p)
-{
-    InterlockedOr(&port_decided_bitmap[p >> 5], (LONG)(1u << (p & 31)));
-    InterlockedOr(&port_direct_bitmap[p >> 5],  (LONG)(1u << (p & 31)));
-}
-static __forceinline void port_set_decided(UINT16 p)  // decided, but NOT direct (proxy/block)
-{
-    InterlockedOr(&port_decided_bitmap[p >> 5], (LONG)(1u << (p & 31)));
-    // leave port_direct_bitmap bit at 0
-}
-static __forceinline void port_clear(UINT16 p)
-{
-    InterlockedAnd(&port_decided_bitmap[p >> 5], (LONG)~(1u << (p & 31)));
-    InterlockedAnd(&port_direct_bitmap[p >> 5],  (LONG)~(1u << (p & 31)));
-}
+/* Port decision cache moved to process/nb_port_decision.c (TTL + invalidation). */
+static __forceinline BOOL port_is_decided(UINT16 p) { return nb_port_is_decided(p); }
+static __forceinline BOOL port_is_direct(UINT16 p)  { return nb_port_is_direct(p); }
+static __forceinline void port_set_direct(UINT16 p) { nb_port_set_direct(p); }
+static __forceinline void port_set_decided(UINT16 p){ nb_port_set_decided(p); }
+static __forceinline void port_clear(UINT16 p)      { nb_port_clear(p); }
 
 static UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
 static BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
@@ -430,12 +413,27 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             UINT8 ip_ver = (packet[0] >> 4) & 0xF;
             if (ip_ver == 4 && packet_len >= 24)
             {
-                UINT8 proto = packet[9];
                 UINT8 ihl = (packet[0] & 0xF) * 4;
                 if (packet_len >= ihl + 4)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + ihl));
                     UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));
+                    BOOL is_relay = (sp == g_local_relay_port || dp == g_local_relay_port ||
+                                     sp == LOCAL_UDP_RELAY_PORT || dp == LOCAL_UDP_RELAY_PORT);
+                    if (!is_relay)
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
+            }
+            else if (ip_ver == 6 && packet_len >= 44)
+            {
+                UINT8 proto = packet[6];
+                if (proto == 6 || proto == 17)
+                {
+                    UINT16 sp = ntohs(*(UINT16*)(packet + 40));
+                    UINT16 dp = ntohs(*(UINT16*)(packet + 42));
                     BOOL is_relay = (sp == g_local_relay_port || dp == g_local_relay_port ||
                                      sp == LOCAL_UDP_RELAY_PORT || dp == LOCAL_UDP_RELAY_PORT);
                     if (!is_relay)
@@ -463,6 +461,23 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + ihl));
                     UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));
+                    if (port_is_decided(sp) && port_is_direct(sp) &&
+                        port_is_decided(dp) && port_is_direct(dp))
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+                }
+            }
+            else if (ip_ver == 6 && packet_len >= 48)
+            {
+                /* IPv6 fixed header 40 bytes; TCP/UDP ports at +40 when no ext headers.
+                 * If extension headers exist we fall through to full parse. */
+                UINT8 proto = packet[6];
+                if (proto == 6 || proto == 17)
+                {
+                    UINT16 sp = ntohs(*(UINT16*)(packet + 40));
+                    UINT16 dp = ntohs(*(UINT16*)(packet + 42));
                     if (port_is_decided(sp) && port_is_direct(sp) &&
                         port_is_decided(dp) && port_is_direct(dp))
                     {
@@ -1249,174 +1264,24 @@ static UINT32 resolve_hostname(const char *hostname)
 
 static DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port)
 {
-    // check cache first
-    DWORD cached_pid = get_cached_pid(src_ip, src_port, FALSE);
-    if (cached_pid != 0)
-        return cached_pid;
-
-    MIB_TCPTABLE_OWNER_PID *tcp_table = NULL;
-    DWORD size = 0;
-    DWORD pid = 0;
-
-    if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET,
-                            TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER)
-    {
-        return 0;
-    }
-
-    tcp_table = (MIB_TCPTABLE_OWNER_PID *)malloc(size);
-    if (tcp_table == NULL)
-    {
-        return 0;
-    }
-
-    if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET,
-                            TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
-    {
-        free(tcp_table);
-        return 0;
-    }
-
-    for (DWORD i = 0; i < tcp_table->dwNumEntries; i++)
-    {
-        MIB_TCPROW_OWNER_PID *row = &tcp_table->table[i];
-
-        if (row->dwLocalAddr == src_ip &&
-            ntohs((UINT16)row->dwLocalPort) == src_port)
-        {
-            pid = row->dwOwningPid;
-            break;
-        }
-    }
-
-    free(tcp_table);
-
-    // store cache the result
-    if (pid != 0)
-        cache_pid(src_ip, src_port, pid, FALSE);
-
-    return pid;
+    /* Snapshot-backed lookup: reuses GetExtendedTcpTable results for ~80ms. */
+    return nb_pid_lookup_tcp4(src_ip, src_port);
 }
 
 // Get process ID for UDP connection
 static DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port)
 {
-    DWORD cached_pid = get_cached_pid(src_ip, src_port, TRUE);
-    if (cached_pid != 0)
-        return cached_pid;
-
-    MIB_UDPTABLE_OWNER_PID *udp_table = NULL;
-    DWORD size = 0;
-    DWORD pid = 0;
-
-    if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET,
-                            UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER)
-    {
-        return 0;
-    }
-
-    udp_table = (MIB_UDPTABLE_OWNER_PID *)malloc(size);
-    if (udp_table == NULL)
-    {
-        return 0;
-    }
-
-    if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET,
-                            UDP_TABLE_OWNER_PID, 0) != NO_ERROR)
-    {
-        free(udp_table);
-        return 0;
-    }
-
-    // First pass: Try exact match (IP + port)
-    for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
-    {
-        MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
-
-        if (row->dwLocalAddr == src_ip &&
-            ntohs((UINT16)row->dwLocalPort) == src_port)
-        {
-            pid = row->dwOwningPid;
-            break;
-        }
-    }
-
-    // Second pass: If not found, try matching port on 0.0.0.0 (INADDR_ANY)
-    // Many UDP applications bind to 0.0.0.0:port instead of specific IP
-    if (pid == 0)
-    {
-        for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
-        {
-            MIB_UDPROW_OWNER_PID *row = &udp_table->table[i];
-
-            if (row->dwLocalAddr == 0 &&  // 0.0.0.0 (INADDR_ANY)
-                ntohs((UINT16)row->dwLocalPort) == src_port)
-            {
-                pid = row->dwOwningPid;
-                break;
-            }
-        }
-    }
-
-    free(udp_table);
-
-    if (pid != 0)
-        cache_pid(src_ip, src_port, pid, TRUE);
-
-    return pid;
+    return nb_pid_lookup_udp4(src_ip, src_port);
 }
 
 static DWORD get_process_id_from_connection_v6(const UINT8 src_ip6[16], UINT16 src_port)
 {
-    MIB_TCP6TABLE_OWNER_PID *tcp_table = NULL;
-    DWORD size = 0, pid = 0;
-
-    if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER)
-        return 0;
-    tcp_table = (MIB_TCP6TABLE_OWNER_PID *)malloc(size);
-    if (!tcp_table) return 0;
-    if (GetExtendedTcpTable(tcp_table, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR)
-    {
-        for (DWORD i = 0; i < tcp_table->dwNumEntries; i++)
-        {
-            MIB_TCP6ROW_OWNER_PID *row = &tcp_table->table[i];
-            if (ntohs((UINT16)row->dwLocalPort) == src_port &&
-                memcmp(row->ucLocalAddr, src_ip6, 16) == 0)
-            {
-                pid = row->dwOwningPid;
-                break;
-            }
-        }
-    }
-    free(tcp_table);
-    return pid;
+    return nb_pid_lookup_tcp6(src_ip6, src_port);
 }
 
 static DWORD get_process_id_from_udp_connection_v6(const UINT8 src_ip6[16], UINT16 src_port)
 {
-    MIB_UDP6TABLE_OWNER_PID *udp_table = NULL;
-    DWORD size = 0, pid = 0;
-
-    if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER)
-        return 0;
-    udp_table = (MIB_UDP6TABLE_OWNER_PID *)malloc(size);
-    if (!udp_table) return 0;
-    if (GetExtendedUdpTable(udp_table, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) == NO_ERROR)
-    {
-        for (DWORD i = 0; i < udp_table->dwNumEntries; i++)
-        {
-            MIB_UDP6ROW_OWNER_PID *row = &udp_table->table[i];
-            if (ntohs((UINT16)row->dwLocalPort) == src_port &&
-                (memcmp(row->ucLocalAddr, src_ip6, 16) == 0 ||
-                 memcmp(row->ucLocalAddr, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0))
-            {
-                pid = row->dwOwningPid;
-                break;
-            }
-        }
-    }
-    free(udp_table);
-    return pid;
+    return nb_pid_lookup_udp6(src_ip6, src_port);
 }
 
 static BOOL is_ipv6_multicast_or_linklocal(const UINT8 ip6[16])
@@ -3373,9 +3238,7 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
                 get_connection_full_v6(cp, cc->orig_dest_ip6, &cc->orig_dest_port, &cc->proxy_config_id) : \
                 get_connection_full(cp, &cc->orig_dest_ip, &cc->orig_dest_port, &cc->proxy_config_id); \
             if (!ok) { closesocket(cs); free(cc); break; } \
-            HANDLE t = CreateThread(NULL, 1, connection_handler, (LPVOID)cc, 0, NULL); \
-            if (t == NULL) { closesocket(cs); free(cc); break; } \
-            CloseHandle(t); \
+            if (!nb_worker_pool_submit(connection_handler, (LPVOID)cc)) { closesocket(cs); free(cc); break; } \
         } while(0)
 
         if (FD_ISSET(listen_sock, &read_fds))
@@ -3395,9 +3258,7 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
                     UINT16 client_port = ntohs(client_addr.sin_port);
                     if (get_connection_full(client_port, &conn_config->orig_dest_ip, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
                     {
-                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
-                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
-                        else { closesocket(client_sock); free(conn_config); }
+                        if (!nb_worker_pool_submit(connection_handler, (LPVOID)conn_config)) { closesocket(client_sock); free(conn_config); }
                     }
                     else { closesocket(client_sock); free(conn_config); }
                 }
@@ -3422,9 +3283,7 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
                     UINT16 client_port = ntohs(client_addr6.sin6_port);
                     if (get_connection_full_v6(client_port, conn_config->orig_dest_ip6, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
                     {
-                        HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
-                        if (conn_thread != NULL) { CloseHandle(conn_thread); }
-                        else { closesocket(client_sock6); free(conn_config); }
+                        if (!nb_worker_pool_submit(connection_handler, (LPVOID)conn_config)) { closesocket(client_sock6); free(conn_config); }
                     }
                     else { closesocket(client_sock6); free(conn_config); }
                 }
@@ -3701,7 +3560,7 @@ static DWORD WINAPI transfer_handler(LPVOID arg)
     dn->pair = pair;  dn->from = sock_proxy;   dn->to = sock_client;
 
     // Spawn the upload relay in its own thread.
-    HANDLE upload_thread = CreateThread(NULL, 0, one_way_relay, up, 0, NULL);
+    HANDLE upload_thread = CreateThread(NULL, 0, one_way_relay, up, 0, NULL); /* keep dedicated for peer-wait */
     if (!upload_thread)
     {
         free(up);
@@ -4706,6 +4565,7 @@ static DWORD WINAPI cleanup_worker(LPVOID arg)
         if (running)
         {
             cleanup_stale_connections();
+            nb_port_decision_expire();
         }
     }
     return 0;
@@ -4736,6 +4596,9 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 
     InitializeSRWLock(&lock);
     dns_cache_init();
+    nb_port_decision_init();
+    nb_pid_table_init();
+    nb_worker_pool_init(8);
 
 #if NB_USE_NETBRIDGE
     nb_procname_init();
@@ -4750,6 +4613,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 #endif
 
     running = TRUE;
+    nb_port_decision_clear_all();
 
     proxy_thread = CreateThread(NULL, 1, local_proxy_server, NULL, 0, NULL);
     if (proxy_thread == NULL)
@@ -4787,13 +4651,20 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 
     Sleep(200);
 
+    /* Tightened filter:
+     * - outbound/loopback TCP+UDP for process classification
+     * - relay ports both directions for NAT restore
+     * - DNS responses (UDP src 53) for snoop cache
+     * - drop obvious non-app noise (IGMP/ICMP not selected)
+     */
     snprintf(filter, sizeof(filter),
-        "((tcp or udp) and (outbound or loopback or "
-        "tcp.DstPort == %d or tcp.SrcPort == %d or "
-        "udp.DstPort == %d or udp.SrcPort == %d)) or "
+        "((tcp or udp) and (outbound or loopback) and "
+        "not (udp.DstPort == 137 or udp.DstPort == 138 or udp.DstPort == 5353 or udp.DstPort == 5355)) or "
+        "(tcp.DstPort == %d or tcp.SrcPort == %d or "
+        "udp.DstPort == %d or udp.SrcPort == %d) or "
         "(udp and not outbound and udp.SrcPort == 53)",
         g_local_relay_port, g_local_relay_port,
-        g_local_relay_port, g_local_relay_port);
+        LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT);
 
     // Note: Added 'loopback' to filter to capture localhost (127.x.x.x) traffic
     // This enables proxying local connections for MITM scenarios
@@ -4923,6 +4794,9 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 
 #if NB_USE_NETBRIDGE
     nb_session_shutdown();
+    nb_worker_pool_shutdown();
+    nb_pid_table_shutdown();
+    nb_port_decision_clear_all();
     nb_tcp_pool_shutdown();
     nb_buf_shutdown();
     nb_procname_clear();
@@ -4983,8 +4857,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 
     // Reset per-port decision cache so stale entries don't carry over
     // if ProxyBridge is stopped and restarted with different rules.
-    memset((void*)port_decided_bitmap, 0, sizeof(port_decided_bitmap));
-    memset((void*)port_direct_bitmap,  0, sizeof(port_direct_bitmap));
+    nb_port_decision_clear_all();
+
 
     log_message("ProxyBridge stopped");
 
