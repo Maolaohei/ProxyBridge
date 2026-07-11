@@ -1,4 +1,4 @@
-#include "process/nb_flow_decision.h"
+﻿#include "process/nb_flow_decision.h"
 
 #include <string.h>
 
@@ -23,6 +23,10 @@ typedef struct {
 static FlowEntry g_table[FLOW_TABLE_SIZE];
 static volatile LONG g_inited;
 static SRWLOCK g_lock;
+
+/* O(1) secondary cache for src-port hot path (bitmap, 65536 bits each). */
+static volatile LONG g_port_decided[2048]; /* 65536 / 32 */
+static volatile LONG g_port_direct[2048];
 
 static ULONGLONG now_ms(void)
 {
@@ -62,6 +66,8 @@ void nb_flow_decision_init(void)
         return;
     InitializeSRWLock(&g_lock);
     ZeroMemory(g_table, sizeof(g_table));
+    ZeroMemory((void*)g_port_decided, sizeof(g_port_decided));
+    ZeroMemory((void*)g_port_direct, sizeof(g_port_direct));
 }
 
 void nb_flow_decision_clear_all(void)
@@ -69,6 +75,8 @@ void nb_flow_decision_clear_all(void)
     AcquireSRWLockExclusive(&g_lock);
     ZeroMemory(g_table, sizeof(g_table));
     ReleaseSRWLockExclusive(&g_lock);
+    ZeroMemory((void*)g_port_decided, sizeof(g_port_decided));
+    ZeroMemory((void*)g_port_direct, sizeof(g_port_direct));
 }
 
 void nb_flow_decision_expire(void)
@@ -272,57 +280,63 @@ void nb_flow_clear_src_port_v6(UINT16 src_port)
     ReleaseSRWLockExclusive(&g_lock);
 }
 
-/* ---- port-level compatibility wrappers (src-port only) ---- */
+/* ---- port-level secondary cache (O(1) bitmap) + flow invalidation ---- */
+static __forceinline void port_bit_set(volatile LONG *bits, UINT16 p)
+{
+    UINT32 idx = (UINT32)p >> 5;
+    LONG mask = (LONG)(1u << (p & 31));
+    InterlockedOr(&bits[idx], mask);
+}
+
+static __forceinline void port_bit_clear(volatile LONG *bits, UINT16 p)
+{
+    UINT32 idx = (UINT32)p >> 5;
+    LONG mask = (LONG)(1u << (p & 31));
+    InterlockedAnd(&bits[idx], ~mask);
+}
+
+static __forceinline BOOL port_bit_test(const volatile LONG *bits, UINT16 p)
+{
+    UINT32 idx = (UINT32)p >> 5;
+    LONG mask = (LONG)(1u << (p & 31));
+    return (bits[idx] & mask) != 0;
+}
+
 void nb_port_decision_init(void) { nb_flow_decision_init(); }
 void nb_port_decision_clear_all(void) { nb_flow_decision_clear_all(); }
 void nb_port_decision_expire(void) { nb_flow_decision_expire(); }
 
 BOOL nb_port_is_decided(UINT16 p)
 {
-    /* Scan for any active flow with this src port. */
     if (!g_inited) return FALSE;
-    ULONGLONG now = now_ms();
-    AcquireSRWLockShared(&g_lock);
-    for (UINT32 i = 0; i < FLOW_TABLE_SIZE; i++) {
-        if (g_table[i].used && g_table[i].src_port == p && g_table[i].expires > now) {
-            ReleaseSRWLockShared(&g_lock);
-            return TRUE;
-        }
-    }
-    ReleaseSRWLockShared(&g_lock);
-    return FALSE;
+    return port_bit_test(g_port_decided, p);
 }
 
 BOOL nb_port_is_direct(UINT16 p)
 {
     if (!g_inited) return FALSE;
-    ULONGLONG now = now_ms();
-    AcquireSRWLockShared(&g_lock);
-    for (UINT32 i = 0; i < FLOW_TABLE_SIZE; i++) {
-        if (g_table[i].used && g_table[i].src_port == p && g_table[i].expires > now &&
-            g_table[i].decision == NB_FLOW_DIRECT) {
-            ReleaseSRWLockShared(&g_lock);
-            return TRUE;
-        }
-    }
-    ReleaseSRWLockShared(&g_lock);
-    return FALSE;
+    return port_bit_test(g_port_direct, p);
 }
 
 void nb_port_set_direct(UINT16 p)
 {
-    /* Compatibility: store as wildcard dst flow (0/0) keyed by src port only. */
-    nb_flow_set_v4(0, p, 0, 0, 0, NB_FLOW_DIRECT);
+    if (!g_inited) nb_flow_decision_init();
+    port_bit_set(g_port_decided, p);
+    port_bit_set(g_port_direct, p);
 }
 
 void nb_port_set_decided(UINT16 p)
 {
-    nb_flow_set_v4(0, p, 0, 0, 0, NB_FLOW_DECIDED);
+    if (!g_inited) nb_flow_decision_init();
+    port_bit_set(g_port_decided, p);
+    port_bit_clear(g_port_direct, p);
 }
 
 void nb_port_clear(UINT16 p)
 {
+    port_bit_clear(g_port_decided, p);
+    port_bit_clear(g_port_direct, p);
+    /* Also drop any 5-tuple entries using this local source port. */
     nb_flow_clear_src_port_v4(p);
     nb_flow_clear_src_port_v6(p);
-    nb_flow_clear_v4(0, p, 0, 0, 0);
 }

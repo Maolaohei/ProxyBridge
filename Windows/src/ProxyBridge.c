@@ -429,7 +429,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             if (ip_ver == 4 && packet_len >= 24)
             {
                 UINT8 ihl = (packet[0] & 0xF) * 4;
-                if (packet_len >= ihl + 4)
+                if (packet_len >= (UINT)ihl + 4u)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + ihl));
                     UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));
@@ -472,7 +472,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
             {
                 UINT8 proto = packet[9];
                 UINT8 ihl = (packet[0] & 0xF) * 4;
-                if ((proto == 6 || proto == 17) && packet_len >= ihl + 4)
+                if ((proto == 6 || proto == 17) && packet_len >= (UINT)ihl + 4u)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + ihl));
                     UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));

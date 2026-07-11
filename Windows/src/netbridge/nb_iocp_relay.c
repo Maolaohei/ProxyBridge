@@ -166,15 +166,24 @@ void nb_iocp_relay_shutdown(void)
     InterlockedExchange(&g_inited, 0);
 }
 
+static void sock_tune(SOCKET s)
+{
+    BOOL on = 1;
+    int buf = 256 * 1024;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof(on));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&buf, sizeof(buf));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&buf, sizeof(buf));
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+}
+
 int nb_iocp_relay_start(SOCKET a, SOCKET b)
 {
     if (!g_iocp) nb_iocp_relay_init();
     if (!g_iocp) return -1;
 
-    /* Ensure non-blocking for overlapped IO */
-    u_long nb = 1;
-    ioctlsocket(a, FIONBIO, &nb);
-    ioctlsocket(b, FIONBIO, &nb);
+    sock_tune(a);
+    sock_tune(b);
 
     NB_IOCP_CONN *conn = conn_alloc();
     if (!conn) return -1;
@@ -199,12 +208,12 @@ int nb_iocp_relay_start(SOCKET a, SOCKET b)
         return -1;
     }
     if (!post_recv(b, &conn->ov_b_recv, &conn->buf_b_recv)) {
-        /* A recv is outstanding under IOCP; transfer ownership and let worker tear down. */
+        /* A recv already posted: keep ownership in conn and let worker tear down. */
         InterlockedExchange(&conn->active, 0);
         shutdown(a, SD_BOTH);
         shutdown(b, SD_BOTH);
-        conn_release(conn); /* one direction ended; worker releases the other */
-        return 0; /* ownership transferred; do not let caller close */
+        conn_release(conn);
+        return 0;
     }
     return 0;
 }

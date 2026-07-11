@@ -347,6 +347,19 @@ static void test_flow_decision_5tuple(void)
     assert(nb_flow_lookup_v4(0x0100007f, 12345, 0x08080808, 443, 6) == NB_FLOW_NONE);
     PASS();
 
+    TEST("port bitmap O(1) decided/direct");
+    nb_port_set_direct(33333);
+    assert(nb_port_is_decided(33333));
+    assert(nb_port_is_direct(33333));
+    nb_port_set_decided(33334);
+    assert(nb_port_is_decided(33334));
+    assert(!nb_port_is_direct(33334));
+    nb_port_clear(33333);
+    nb_port_clear(33334);
+    assert(!nb_port_is_decided(33333));
+    assert(!nb_port_is_decided(33334));
+    PASS();
+
     TEST("flow v6 set/lookup DIRECT");
     {
         UINT8 s6[16] = {0}; s6[15] = 1;
