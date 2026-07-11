@@ -9,7 +9,9 @@
     [Parameter(Mandatory=$false)]
     [switch]$PGO,
     [Parameter(Mandatory=$false)]
-    [switch]$PgoOptimize
+    [switch]$PgoOptimize,
+    [Parameter(Mandatory=$false)]
+    [string]$PgoProfileDir = "pgo-profile"
 )
 
 $WinDivertPath = "D:\UGit\v2rayN\v2rayN\WinDivert-2.2.2-A"
@@ -74,14 +76,18 @@ function Compile-MSVC {
     "$SourcePath\netbridge\nb_session.c",
     "$SourcePath\netbridge\nb_buf.c",
     "$SourcePath\netbridge\nb_worker_pool.c",
-    "$SourcePath\netbridge\nb_iocp_relay.c"
+    "$SourcePath\netbridge\nb_iocp_relay.c",
+    "$SourcePath\dns\nb_dns_cache.c",
+    "$SourcePath\conn\nb_conn_table.c"
 )
 
 
-# PGO release recipe:
-#   1) .\compile.ps1 -PGO          # instrumented build
-#   2) run typical hijack workloads to produce .pgd/.pgc
-#   3) .\compile.ps1 -PgoOptimize  # rebuild with /USEPROFILE
+# PGO release recipe (MSVC only):
+#   1) .\compile.ps1 -PGO                         # instrumented build -> output\ + pgo-profile\
+#   2) run representative hijack workload against ProxyBridgeCore.dll
+#      (profiles land as ProxyBridgeCore!*.pgc next to the DLL / PGD)
+#   3) .\compile.ps1 -PgoOptimize                 # /USEPROFILE rebuild into output\
+# Optional: -PgoProfileDir path  (default: pgo-profile)
 if ($PgoOptimize -and -not $PGO) {
     Write-Host "PGO optimize-only mode (/USEPROFILE)" -ForegroundColor Cyan
 }
@@ -99,8 +105,10 @@ $clArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 
               "/OUT:$OutputDLL"
 
     if ($PGO -and -not $PgoOptimize) {
-        $clArgs += " /GENPROFILE"
-        Write-Host "  PGO: Instrumenting for profile collection" -ForegroundColor Yellow
+        if (-not (Test-Path $PgoProfileDir)) { New-Item -ItemType Directory -Path $PgoProfileDir -Force | Out-Null }
+        $pgdOut = (Resolve-Path $PgoProfileDir).Path + "\$OutputDLL.pgd"
+        $clArgs += " /GENPROFILE /PGD=`"$pgdOut`""
+        Write-Host "  PGO: Instrumenting for profile collection -> $pgdOut" -ForegroundColor Yellow
     }
 
     $cmd = "`"$vcvarsPath`" $Arch >nul && cl.exe $clArgs"
@@ -136,7 +144,9 @@ function Compile-GCC {
         "$SourcePath/netbridge/nb_session.c",
         "$SourcePath/netbridge/nb_buf.c",
         "$SourcePath/netbridge/nb_worker_pool.c",
-        "$SourcePath/netbridge/nb_iocp_relay.c"
+        "$SourcePath/netbridge/nb_iocp_relay.c",
+        "$SourcePath/dns/nb_dns_cache.c",
+        "$SourcePath/conn/nb_conn_table.c"
     )
 
     $cmd = "gcc -shared -O2 -flto -s -Wall -D_WIN32_WINNT=0x0601 -DPROXYBRIDGE_EXPORTS " +
@@ -187,10 +197,10 @@ function Sign-Binary {
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -eq 0) {
-        Write-Host "    鉁?Signed successfully" -ForegroundColor Green
+        Write-Host "    閴?Signed successfully" -ForegroundColor Green
         return $true
     } else {
-        Write-Host "    鉁?Signing failed: $result" -ForegroundColor Red
+        Write-Host "    閴?Signing failed: $result" -ForegroundColor Red
         return $false
     }
 }
@@ -200,7 +210,7 @@ function Sign-Binary {
 
 $success = $false
 
-# 鈹€鈹€ Build and run tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# 閳光偓閳光偓 Build and run tests 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 Write-Host "`nBuilding tests..." -ForegroundColor Green
 $TestFiles = @(
     "test.c",
@@ -212,7 +222,9 @@ $TestFiles = @(
     "$SourcePath/netbridge/nb_session.c",
     "$SourcePath/netbridge/nb_buf.c",
     "$SourcePath/netbridge/nb_worker_pool.c",
-    "$SourcePath/netbridge/nb_iocp_relay.c"
+    "$SourcePath/netbridge/nb_iocp_relay.c",
+        "$SourcePath/dns/nb_dns_cache.c",
+        "$SourcePath/conn/nb_conn_table.c"
 )
 
 if ($Compiler -eq 'auto' -or $Compiler -eq 'msvc') {
@@ -279,7 +291,8 @@ if ($success) {
 
     if (($PGO -or $PgoOptimize) -and $Compiler -ne 'gcc') {
         Write-Host "`nPGO: Rebuilding with profile data..." -ForegroundColor Green
-        $pgdFile = "$OutputDLL.pgd"
+        $pgdFile = Join-Path $PgoProfileDir "$OutputDLL.pgd"
+        if (-not (Test-Path $pgdFile) -and (Test-Path "$OutputDLL.pgd")) { $pgdFile = "$OutputDLL.pgd" }
         if (Test-Path $pgdFile) {
             $pgoClArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
                 "/DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG " +
@@ -292,7 +305,7 @@ if ($success) {
                 "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT " +
                 "/LIBPATH:`"$WinDivertPath\$Arch`" " +
                 "WinDivert.lib ws2_32.lib iphlpapi.lib " +
-                "/OUT:$OutputDLL /USEPROFILE"
+                "/OUT:$OutputDLL /USEPROFILE /PGD=`"$pgdFile`" "
             $pgoCmd = "`"$vcvarsPath`" $Arch >nul && cl.exe $pgoClArgs"
             $pgoResult = cmd /c $pgoCmd '2>&1'
             if ($LASTEXITCODE -eq 0) {
@@ -353,7 +366,7 @@ if ($success) {
         Write-Host $publishResult
     }
 
-    # 鈹€鈹€ Build CLI 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 閳光偓閳光偓 Build CLI 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
     Write-Host "`nBuilding CLI..." -ForegroundColor Green
     if ($script:foundVcvarsPath -and (Test-Path $script:foundVcvarsPath)) {
         $cliArgs = "/nologo /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 /wd4996 " +
