@@ -4058,6 +4058,211 @@ static void update_has_active_rules(void)
     }
 }
 
+/*
+ * Ensure the WinDivert driver service is installed and points to our driver.
+ * Priority: use our own WinDivert64.sys first; if unavailable, fall back to
+ * whatever driver is already installed.
+ *
+ * Conflict handling:
+ *   - If "WinDivert" service exists but points to a different driver,
+ *     stop → delete → reinstall pointing to our driver.
+ *   - If service is already running, stop → restart to load correct version.
+ *
+ * Returns: TRUE if our own driver is loaded, FALSE if fallback.
+ */
+static BOOL ensure_windivert_driver(void)
+{
+    SC_HANDLE scm = NULL;
+    SC_HANDLE svc = NULL;
+    BOOL our_driver_loaded = FALSE;
+    char our_driver_path[MAX_PATH];
+    char svc_image_path[MAX_PATH];
+    DWORD svc_image_path_len = sizeof(svc_image_path);
+
+    /* Build the full path to our WinDivert64.sys (same dir as this DLL) */
+    HMODULE hMod = NULL;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&ensure_windivert_driver, &hMod))
+    {
+        log_message("[NetBridge] Failed to get module handle for driver path");
+        return FALSE;
+    }
+    if (!GetModuleFileNameA(hMod, our_driver_path, sizeof(our_driver_path)))
+    {
+        log_message("[NetBridge] Failed to get module file name");
+        return FALSE;
+    }
+    /* Replace the DLL filename with WinDivert64.sys in the same directory */
+    {
+        char *last_slash = strrchr(our_driver_path, '\\');
+        if (last_slash)
+        {
+            *(last_slash + 1) = '\0';
+            strcat(our_driver_path, "WinDivert64.sys");
+        }
+        else
+        {
+            log_message("[NetBridge] Invalid module path");
+            return FALSE;
+        }
+    }
+
+    /* Verify our driver file exists */
+    if (GetFileAttributesA(our_driver_path) == INVALID_FILE_ATTRIBUTES)
+    {
+        log_message("[NetBridge] Our WinDivert64.sys not found at: %s - using system driver", our_driver_path);
+        return FALSE;
+    }
+
+    scm = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm)
+    {
+        log_message("[NetBridge] Cannot open Service Control Manager (error %lu) - using system driver", GetLastError());
+        return FALSE;
+    }
+
+    svc = OpenServiceA(scm, "WinDivert", SERVICE_QUERY_CONFIG | SERVICE_START | SERVICE_STOP | DELETE);
+    if (!svc)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST)
+        {
+            /* No WinDivert service exists - install ours */
+            log_message("[NetBridge] No WinDivert service found, installing from: %s", our_driver_path);
+            svc = CreateServiceA(
+                scm, "WinDivert", "WinDivert",
+                SERVICE_ALL_ACCESS,
+                SERVICE_KERNEL_DRIVER,
+                SERVICE_DEMAND_START,
+                SERVICE_ERROR_NORMAL,
+                our_driver_path,
+                NULL, NULL, NULL, NULL, NULL);
+            if (svc)
+            {
+                our_driver_loaded = TRUE;
+                log_message("[NetBridge] WinDivert service installed with our driver");
+            }
+            else
+            {
+                log_message("[NetBridge] Failed to install WinDivert service (error %lu)", GetLastError());
+            }
+        }
+        else
+        {
+            log_message("[NetBridge] Cannot query WinDivert service (error %lu) - using system driver", err);
+        }
+        goto cleanup;
+    }
+
+    /* Service exists - check if it points to our driver */
+    if (QueryServiceConfigA(svc, NULL, 0, &svc_image_path_len) ||
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+    {
+        LPQUERY_SERVICE_CONFIGA cfg = (LPQUERY_SERVICE_CONFIGA)HeapAlloc(GetProcessHeap(), 0, svc_image_path_len);
+        if (cfg && QueryServiceConfigA(svc, cfg, svc_image_path_len, &svc_image_path_len))
+        {
+            strncpy(svc_image_path, cfg->lpBinaryPathName, sizeof(svc_image_path) - 1);
+            svc_image_path[sizeof(svc_image_path) - 1] = '\0';
+            HeapFree(GetProcessHeap(), 0, cfg);
+
+            /* Normalize paths for comparison (case-insensitive) */
+            CharLowerA(our_driver_path);
+            CharLowerA(svc_image_path);
+
+            if (strstr(svc_image_path, our_driver_path) != NULL ||
+                strcmp(svc_image_path, our_driver_path) == 0)
+            {
+                /* Service points to our driver, but may be running an old version.
+                 * Force stop + restart to ensure the correct driver is loaded. */
+                log_message("[NetBridge] WinDivert service uses our driver, restarting to ensure correct version...");
+
+                SERVICE_STATUS ss;
+                if (ControlService(svc, SERVICE_CONTROL_STOP, &ss))
+                {
+                    log_message("[NetBridge] Old WinDivert driver stopped, waiting for unload...");
+                    Sleep(800); /* Wait for driver to fully unload */
+                }
+
+                if (StartServiceA(svc, 0, NULL))
+                {
+                    log_message("[NetBridge] WinDivert driver started successfully");
+                    our_driver_loaded = TRUE;
+                }
+                else if (GetLastError() == ERROR_SERVICE_ALREADY_RUNNING)
+                {
+                    /* Service started between our stop and start - check if it's the right driver */
+                    log_message("[NetBridge] WinDivert service already running");
+                    our_driver_loaded = TRUE;
+                }
+                else
+                {
+                    log_message("[NetBridge] Failed to start WinDivert service (error %lu)", GetLastError());
+                }
+                goto cleanup;
+            }
+
+            /* Different driver - stop, delete, reinstall ours */
+            log_message("[NetBridge] Conflicting WinDivert driver detected: %s", svc_image_path);
+            log_message("[NetBridge] Stopping and replacing with our driver: %s", our_driver_path);
+
+            SERVICE_STATUS ss;
+            ControlService(svc, SERVICE_CONTROL_STOP, &ss);
+            Sleep(500); /* Let the driver unload */
+
+            if (DeleteService(svc))
+            {
+                log_message("[NetBridge] Old WinDivert service removed");
+                svc = NULL;
+            }
+            else
+            {
+                log_message("[NetBridge] Failed to remove old service (error %lu) - trying to reconfigure", GetLastError());
+                /* Can't delete (in use?) - try to reconfigure */
+                if (ChangeServiceConfigA(svc, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
+                                         SERVICE_ERROR_NORMAL, our_driver_path,
+                                         NULL, NULL, NULL, NULL, NULL, "WinDivert"))
+                {
+                    our_driver_loaded = TRUE;
+                    log_message("[NetBridge] WinDivert service reconfigured to use our driver");
+                    StartServiceA(svc, 0, NULL);
+                    goto cleanup;
+                }
+                log_message("[NetBridge] Failed to reconfigure service (error %lu)", GetLastError());
+            }
+
+            /* Install fresh service */
+            svc = CreateServiceA(
+                scm, "WinDivert", "WinDivert",
+                SERVICE_ALL_ACCESS,
+                SERVICE_KERNEL_DRIVER,
+                SERVICE_DEMAND_START,
+                SERVICE_ERROR_NORMAL,
+                our_driver_path,
+                NULL, NULL, NULL, NULL, NULL);
+            if (svc)
+            {
+                our_driver_loaded = TRUE;
+                StartServiceA(svc, 0, NULL);
+                log_message("[NetBridge] WinDivert service reinstalled with our driver");
+            }
+            else
+            {
+                log_message("[NetBridge] Failed to reinstall WinDivert service (error %lu)", GetLastError());
+            }
+        }
+        else if (cfg)
+        {
+            HeapFree(GetProcessHeap(), 0, cfg);
+        }
+    }
+
+cleanup:
+    if (svc) CloseServiceHandle(svc);
+    if (scm) CloseServiceHandle(scm);
+    return our_driver_loaded;
+}
+
 PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 {
     char filter[FILTER_BUFFER_SIZE];
@@ -4131,19 +4336,47 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
      * - DNS responses (UDP src 53) for snoop cache
      * - drop obvious non-app noise (IGMP/ICMP not selected)
      */
+    /* NOTE: WinDivert's 'not' can only negate a single field test (TEST0),
+     * not a compound (A or B or C) expression. Use '!=' with 'and' instead. */
     snprintf(filter, sizeof(filter),
         "((tcp or udp) and (outbound or loopback) and "
-        "not (udp.DstPort == 137 or udp.DstPort == 138 or udp.DstPort == 5353 or udp.DstPort == 5355)) or "
+        "udp.DstPort != 137 and udp.DstPort != 138 and "
+        "udp.DstPort != 5353 and udp.DstPort != 5355) or "
         "(tcp.DstPort == %d or tcp.SrcPort == %d or "
         "udp.DstPort == %d or udp.SrcPort == %d) or "
-        "(udp and not outbound and udp.SrcPort == 53)",
+        "(udp and !outbound and udp.SrcPort == 53)",
         g_local_relay_port, g_local_relay_port,
         LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT);
 
-    // Note: Added 'loopback' to filter to capture localhost (127.x.x.x) traffic
-    // This enables proxying local connections for MITM scenarios
-    // NOTE: WinDivert 2.2.2 does NOT support the 'port=' shorthand keyword.
-    // Must use tcp.DstPort==/tcp.SrcPort==/udp.DstPort==/udp.SrcPort== instead.
+    /* Ensure our WinDivert driver is installed before opening.
+     * If another program installed an older driver, we replace it with ours.
+     * If we can't install (e.g. no admin), fall back to existing driver. */
+    BOOL using_our_driver = ensure_windivert_driver();
+    if (using_our_driver)
+        log_message("[NetBridge] Using our WinDivert driver");
+    else
+        log_message("[NetBridge] Using system WinDivert driver");
+
+    /* Diagnostic: log the actual filter and validate with compiler */
+    log_message("[NetBridge] WinDivertOpen params: layer=%d, priority=%d, flags=0x%llx",
+        (int)WINDIVERT_LAYER_NETWORK, (int)priority, (unsigned long long)0);
+    log_message("[NetBridge] Filter: %s", filter);
+
+    {
+        const char *errorStr = NULL;
+        UINT errorPos = 0;
+        if (!WinDivertHelperCompileFilter(filter, WINDIVERT_LAYER_NETWORK,
+                                          NULL, 0, &errorStr, &errorPos))
+        {
+            log_message("[NetBridge] Filter compile error at pos %u: %s", errorPos,
+                        errorStr ? errorStr : "(unknown)");
+        }
+        else
+        {
+            log_message("[NetBridge] Filter syntax OK");
+        }
+    }
+
     windivert_handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, priority, 0);
     if (windivert_handle == INVALID_HANDLE_VALUE)
     {
@@ -4159,15 +4392,13 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
             case 577:  // ERROR_INVALID_IMAGE_HASH - driver signature check failed
                 log_message("Failed to open WinDivert (%lu): Driver signature verification failed - WinDivert64.sys may have been modified or blocked by security software. Reinstall ProxyBridge.", wd_err);
                 break;
+            case 87:   // ERROR_INVALID_PARAMETER - filter/layer/priority/flags error
+                log_message("Failed to open WinDivert (%lu): ERROR_INVALID_PARAMETER. "
+                    "layer=%d, priority=%d, flags=0x%llx",
+                    wd_err, (int)WINDIVERT_LAYER_NETWORK, (int)priority, (unsigned long long)0);
+                break;
             case 1058: // ERROR_SERVICE_DISABLED
                 log_message("Failed to open WinDivert (%lu): A stale WinDivert driver entry from a previous install is marked disabled. Reinstall ProxyBridge to fix it, or manually delete the registry key: HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinDivert", wd_err);
-                break;
-            case 87:   // ERROR_INVALID_PARAMETER - driver version mismatch or stale driver
-                log_message("Failed to open WinDivert (%lu): WinDivert driver version mismatch. "
-                    "Another program (e.g. GoodByeDPI, Proxifier) may have installed an older "
-                    "WinDivert driver that doesn't support the 'loopback' filter keyword. "
-                    "Fix: run 'sc delete WinDivert' in an elevated Command Prompt, then restart v2rayN. "
-                    "Or reinstall ProxyBridge to reset the driver.", wd_err);
                 break;
             case 1275: // ERROR_DRIVER_BLOCKED
                 log_message("Failed to open WinDivert (%lu): WinDivert64.sys is blocked by Windows security policy or antivirus (BYOVD protection). Whitelist WinDivert64.sys in your security software.", wd_err);

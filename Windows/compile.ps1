@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory=$false)]
     [ValidateSet('msvc', 'gcc', 'auto')]
     [string]$Compiler = 'auto',
@@ -101,7 +101,7 @@ $clArgs = "/nologo /std:c11 /O2 /Ot /GL /Gy /W4 /wd4100 /wd4189 /wd4267 /wd4244 
               " /LD " +
               "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT " +
               "/LIBPATH:`"$WinDivertPath\$Arch`" " +
-              "WinDivert.lib ws2_32.lib iphlpapi.lib " +
+              "WinDivert.lib ws2_32.lib iphlpapi.lib advapi32.lib user32.lib " +
               "/OUT:$OutputDLL"
 
     if ($PGO -and -not $PgoOptimize) {
@@ -155,7 +155,7 @@ function Compile-GCC {
            "-I`"$SourcePath`" " +
            ($gccSourceFiles -join " ") +
            " -L`"$WinDivertPath\$Arch`" " +
-           "-lWinDivert -lws2_32 -liphlpapi " +
+           "-lWinDivert -lws2_32 -liphlpapi -ladvapi32 -luser32 " +
            "-o $OutputDLL"
 
     Write-Host "Command: $cmd" -ForegroundColor Gray
@@ -304,7 +304,7 @@ if ($success) {
                 " /LD " +
                 "/link /LTCG /OPT:REF /OPT:ICF /RELEASE /DYNAMICBASE /NXCOMPAT " +
                 "/LIBPATH:`"$WinDivertPath\$Arch`" " +
-                "WinDivert.lib ws2_32.lib iphlpapi.lib " +
+                "WinDivert.lib ws2_32.lib iphlpapi.lib advapi32.lib user32.lib " +
                 "/OUT:$OutputDLL /USEPROFILE /PGD=`"$pgdFile`" "
             $pgoCmd = "`"$vcvarsPath`" $Arch >nul && cl.exe $pgoClArgs"
             $pgoResult = cmd /c $pgoCmd '2>&1'
