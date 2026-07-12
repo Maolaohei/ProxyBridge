@@ -324,6 +324,17 @@ static int send_all(SOCKET sock, const char *buf, int len)
     return sent;
 }
 
+static int recv_all(SOCKET sock, char *buf, int len)
+{
+    int received = 0;
+    while (received < len) {
+        int n = recv(sock, buf + received, len - received, 0);
+        if (n <= 0) return n == 0 ? 0 : SOCKET_ERROR;
+        received += n;
+    }
+    return received;
+}
+
 static UINT32 parse_ipv4(const char *ip);
 static UINT32 resolve_hostname(const char *hostname);
 static PROXY_CONFIG* find_proxy_config(UINT32 config_id);
@@ -1179,6 +1190,18 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 }
                 else if (action == RULE_ACTION_PROXY)
             {
+                // Only proxy new TCP connections (SYN flag set).
+                // Non-SYN packets for connections that went direct (e.g. due to a
+                // PID-lookup race) would be incorrectly redirected to the local relay,
+                // corrupting the TCP state machine and causing hangs (e.g. curl.exe).
+                if (!tcp_header->Syn)
+                {
+                    flow4_set(src_ip, src_port, orig_dest_ip, orig_dest_port, 6, NB_FLOW_DIRECT);
+                    port_set_direct(src_port);
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+
                 add_connection(src_port, src_ip, orig_dest_ip, orig_dest_port, proxy_config_id);
                 flow4_set(src_ip, src_port, orig_dest_ip, orig_dest_port, 6, NB_FLOW_DECIDED);
                 // Mark this port as decided (not direct) so subsequent packets from
@@ -1998,7 +2021,7 @@ static int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_por
     if (use_auth) { buf[1] = 0x02; buf[2] = SOCKS5_AUTH_NONE; buf[3] = 0x02; if (send(s, (char*)buf, 4, 0) != 4) return -1; }
     else          { buf[1] = 0x01; buf[2] = SOCKS5_AUTH_NONE;                 if (send(s, (char*)buf, 3, 0) != 3) return -1; }
 
-    len = recv(s, (char*)buf, 2, 0);
+    len = recv_all(s, (char*)buf, 2);
     if (len != 2 || buf[0] != SOCKS5_VERSION) return -1;
 
     if (buf[1] == 0x02)
@@ -2012,7 +2035,7 @@ static int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_por
         buf[2 + user_len] = (unsigned char)pass_len;
         memcpy(&buf[3 + user_len], cfg->password, pass_len);
         if (send(s, (char*)buf, (int)(3 + user_len + pass_len), 0) != (int)(3 + user_len + pass_len)) return -1;
-        len = recv(s, (char*)buf, 2, 0);
+        len = recv_all(s, (char*)buf, 2);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
     }
     else if (buf[1] != SOCKS5_AUTH_NONE) return -1;
@@ -2034,33 +2057,30 @@ static int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_por
     if (send(s, (char*)buf, req_len, 0) != req_len) return -1;
 
     // Read the 4-byte response header: VER REP RSV ATYP
-    len = recv(s, (char*)buf, 4, 0);
-    if (len < 4 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
+    if (recv_all(s, (char*)buf, 4) != 4 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
     {
-        log_message("SOCKS5 domain: CONNECT failed (reply=%d)", len > 1 ? buf[1] : -1);
+        log_message("SOCKS5 domain: CONNECT failed (reply=%d)", buf[1]);
         return -1;
     }
 
-    // Drain BND.ADDR + BND.PORT (we don't use them)
-    int drain = 0;
-    if      (buf[3] == SOCKS5_ATYP_IPV4)   drain = 4 + 2;
-    else if (buf[3] == SOCKS5_ATYP_IPV6)   drain = 16 + 2;
-    else if (buf[3] == SOCKS5_ATYP_DOMAIN)
+    // Drain BND.ADDR + BND.PORT based on ATYP
+    switch (buf[3])
     {
-        unsigned char dlen_buf[1];
-        if (recv(s, (char*)dlen_buf, 1, 0) != 1) return -1;
-        drain = (int)dlen_buf[0] + 2;
-    }
-    if (drain > 0)
-    {
-        unsigned char scratch[270];
-        int total = 0;
-        while (total < drain)
+        case SOCKS5_ATYP_IPV4:   // 4 addr + 2 port = 6 bytes
+            if (recv_all(s, (char*)buf, 6) != 6) return -1;
+            break;
+        case SOCKS5_ATYP_IPV6:   // 16 addr + 2 port = 18 bytes
+            if (recv_all(s, (char*)buf, 18) != 18) return -1;
+            break;
+        case SOCKS5_ATYP_DOMAIN: // 1 len + domain + 2 port
         {
-            int n = recv(s, (char*)(scratch + total), drain - total, 0);
-            if (n <= 0) return -1;
-            total += n;
+            unsigned char dlen;
+            if (recv_all(s, (char*)&dlen, 1) != 1) return -1;
+            if (recv_all(s, (char*)buf, dlen + 2) != (int)(dlen + 2)) return -1;
+            break;
         }
+        default:
+            return -1;
     }
     return 0;
 }
@@ -2095,7 +2115,7 @@ static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROX
         }
     }
 
-    len = recv(s, (char*)buf, 2, 0);
+    len = recv_all(s, (char*)buf, 2);
     if (len != 2 || buf[0] != SOCKS5_VERSION)
     {
         log_message("SOCKS5: Invalid auth response");
@@ -2132,7 +2152,7 @@ static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROX
             return -1;
         }
 
-        len = recv(s, (char*)buf, 2, 0);
+        len = recv_all(s, (char*)buf, 2);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00)
         {
             log_message("SOCKS5: Authentication failed");
@@ -2163,11 +2183,32 @@ static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROX
         return -1;
     }
 
-    len = recv(s, (char*)buf, 10, 0);
-    if (len < 10 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
+    // Read VER(1) + REP(1) + RSV(1) + ATYP(1)
+    if (recv_all(s, (char*)buf, 4) != 4 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
     {
-        log_message("SOCKS5: CONNECT failed (reply=%d)", len > 1 ? buf[1] : -1);
+        log_message("SOCKS5: CONNECT failed (reply=%d)", buf[1]);
         return -1;
+    }
+
+    // Drain the remaining BND.ADDR + BND.PORT based on ATYP
+    switch (buf[3])
+    {
+        case SOCKS5_ATYP_IPV4:   // IPv4: 4 addr + 2 port = 6 bytes
+            if (recv_all(s, (char*)buf, 6) != 6) return -1;
+            break;
+        case SOCKS5_ATYP_IPV6:   // IPv6: 16 addr + 2 port = 18 bytes
+            if (recv_all(s, (char*)buf, 18) != 18) return -1;
+            break;
+        case SOCKS5_ATYP_DOMAIN: // Domain: 1 len + domain + 2 port
+        {
+            unsigned char dlen;
+            if (recv_all(s, (char*)&dlen, 1) != 1) return -1;
+            if (recv_all(s, (char*)buf, dlen + 2) != (int)(dlen + 2)) return -1;
+            break;
+        }
+        default:
+            log_message("SOCKS5: Unknown ATYP 0x%02X in CONNECT response", buf[3]);
+            return -1;
     }
 
     return 0;
@@ -2183,7 +2224,7 @@ static int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_por
     if (use_auth) { buf[1] = 0x02; buf[2] = SOCKS5_AUTH_NONE; buf[3] = 0x02; if (send(s, (char*)buf, 4, 0) != 4) return -1; }
     else          { buf[1] = 0x01; buf[2] = SOCKS5_AUTH_NONE;                 if (send(s, (char*)buf, 3, 0) != 3) return -1; }
 
-    len = recv(s, (char*)buf, 2, 0);
+    len = recv_all(s, (char*)buf, 2);
     if (len != 2 || buf[0] != SOCKS5_VERSION) return -1;
 
     if (buf[1] == 0x02)
@@ -2197,7 +2238,7 @@ static int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_por
         buf[2 + ul] = (unsigned char)pl;
         memcpy(&buf[3 + ul], cfg->password, pl);
         if (send(s, (char*)buf, (int)(3 + ul + pl), 0) != (int)(3 + ul + pl)) return -1;
-        len = recv(s, (char*)buf, 2, 0);
+        len = recv_all(s, (char*)buf, 2);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
     }
     else if (buf[1] != SOCKS5_AUTH_NONE) return -1;
@@ -2212,12 +2253,32 @@ static int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_por
 
     if (send(s, (char*)buf, 22, 0) != 22) return -1;
 
-    // response: VER(1)+REP(1)+RSV(1)+ATYP(1)+BND.ADDR(16)+BND.PORT(2) = 22
-    len = recv(s, (char*)buf, 22, 0);
-    if (len < 4 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
+    // Read VER(1) + REP(1) + RSV(1) + ATYP(1)
+    if (recv_all(s, (char*)buf, 4) != 4 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
     {
-        log_message("SOCKS5 IPv6: CONNECT failed (reply=%d)", len > 1 ? buf[1] : -1);
+        log_message("SOCKS5 IPv6: CONNECT failed (reply=%d)", buf[1]);
         return -1;
+    }
+
+    // Drain the remaining BND.ADDR + BND.PORT based on ATYP
+    switch (buf[3])
+    {
+        case SOCKS5_ATYP_IPV4:   // IPv4: 4 addr + 2 port = 6 bytes
+            if (recv_all(s, (char*)buf, 6) != 6) return -1;
+            break;
+        case SOCKS5_ATYP_IPV6:   // IPv6: 16 addr + 2 port = 18 bytes
+            if (recv_all(s, (char*)buf, 18) != 18) return -1;
+            break;
+        case SOCKS5_ATYP_DOMAIN: // Domain: 1 len + domain + 2 port
+        {
+            unsigned char dlen;
+            if (recv_all(s, (char*)&dlen, 1) != 1) return -1;
+            if (recv_all(s, (char*)buf, dlen + 2) != (int)(dlen + 2)) return -1;
+            break;
+        }
+        default:
+            log_message("SOCKS5 IPv6: Unknown ATYP 0x%02X in CONNECT response", buf[3]);
+            return -1;
     }
     return 0;
 }
@@ -2403,7 +2464,7 @@ static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_
             return -1;
     }
 
-    len = recv(s, (char*)buf, 2, 0);
+    len = recv_all(s, (char*)buf, 2);
     if (len != 2 || buf[0] != SOCKS5_VERSION)
         return -1;
 
@@ -2426,7 +2487,7 @@ static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_
         if (send(s, (char*)buf, 3 + user_len + pass_len, 0) != (int)(3 + user_len + pass_len))
             return -1;
 
-        len = recv(s, (char*)buf, 2, 0);
+        len = recv_all(s, (char*)buf, 2);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00)
             return -1;
     }
@@ -2449,13 +2510,35 @@ static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_
     if (send(s, (char*)buf, 10, 0) != 10)
         return -1;
 
-    len = recv(s, (char*)buf, 10, 0);
-    if (len < 10 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
+    // Read VER(1) + REP(1) + RSV(1) + ATYP(1)
+    if (recv_all(s, (char*)buf, 4) != 4 || buf[0] != SOCKS5_VERSION || buf[1] != 0x00)
         return -1;
 
-    relay_addr->sin_family = AF_INET;
-    relay_addr->sin_addr.s_addr = *(UINT32*)&buf[4];
-    relay_addr->sin_port = *(UINT16*)&buf[8];
+    // Drain BND.ADDR + BND.PORT based on ATYP
+    switch (buf[3])
+    {
+        case SOCKS5_ATYP_IPV4:
+            if (recv_all(s, (char*)buf, 6) != 6) return -1;
+            relay_addr->sin_family = AF_INET;
+            relay_addr->sin_addr.s_addr = *(UINT32*)&buf[0];
+            relay_addr->sin_port = *(UINT16*)&buf[4];
+            break;
+        case SOCKS5_ATYP_IPV6:
+            if (recv_all(s, (char*)buf, 18) != 18) return -1;
+            relay_addr->sin_family = AF_INET;
+            relay_addr->sin_addr.s_addr = *(UINT32*)&buf[12]; // IPv4-mapped in last 4 bytes
+            relay_addr->sin_port = *(UINT16*)&buf[16];
+            break;
+        case SOCKS5_ATYP_DOMAIN:
+        {
+            unsigned char dlen;
+            if (recv_all(s, (char*)&dlen, 1) != 1) return -1;
+            if (recv_all(s, (char*)buf, dlen + 2) != (int)(dlen + 2)) return -1;
+            break;
+        }
+        default:
+            return -1;
+    }
 
     return 0;
 }
@@ -3388,6 +3471,30 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char*
     rule->action = action;
     rule->enabled = TRUE;
     rule->next = NULL;
+
+    // Deduplication: check if an identical rule already exists
+    // (same process, hosts, ports, protocol, action) - skip if so
+    {
+        PROCESS_RULE *existing = rules_list;
+        while (existing != NULL)
+        {
+            if (existing->enabled == rule->enabled &&
+                existing->protocol == rule->protocol &&
+                existing->action == rule->action &&
+                existing->proxy_config_id == rule->proxy_config_id &&
+                strcmp(existing->process_name, rule->process_name) == 0 &&
+                strcmp(existing->target_hosts, rule->target_hosts) == 0 &&
+                strcmp(existing->target_ports, rule->target_ports) == 0)
+            {
+                log_message("Skipped duplicate rule for process '%s' (already exists as ID: %u)", process_name, existing->rule_id);
+                free(rule->target_hosts);
+                free(rule->target_ports);
+                free(rule);
+                return existing->rule_id;
+            }
+            existing = existing->next;
+        }
+    }
 
     // Append to tail so rules are evaluated in the order they were added,
     // matching the visual top-to-bottom order in the GUI (fixes issue #93).

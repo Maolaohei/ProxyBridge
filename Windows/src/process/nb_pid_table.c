@@ -91,28 +91,36 @@ static void cache_put(UINT32 ip, UINT16 port, DWORD pid, BOOL is_udp)
     e->used = TRUE;
 }
 
+/* Retry loop for GetExtended*Table: if the table grows between the size-query
+   and data-query, we get ERROR_INSUFFICIENT_BUFFER again. Retry up to 3 times. */
 static BOOL refresh_tcp4(void)
 {
     ULONGLONG now = GetTickCount64();
     if (g_pt.tcp4 && (now - g_pt.tcp4_ts) < PID_SNAP_TTL_MS)
         return TRUE;
 
-    DWORD size = 0;
-    DWORD rc = GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
-        return FALSE;
+    for (int retry = 0; retry < 3; retry++)
+    {
+        DWORD size = 0;
+        DWORD rc = GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
+            return FALSE;
 
-    MIB_TCPTABLE_OWNER_PID *tbl = (MIB_TCPTABLE_OWNER_PID *)malloc(size);
-    if (!tbl) return FALSE;
-    if (GetExtendedTcpTable(tbl, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+        MIB_TCPTABLE_OWNER_PID *tbl = (MIB_TCPTABLE_OWNER_PID *)malloc(size);
+        if (!tbl) return FALSE;
+        rc = GetExtendedTcpTable(tbl, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (rc == NO_ERROR) {
+            free(g_pt.tcp4);
+            g_pt.tcp4 = tbl;
+            g_pt.tcp4_bytes = size;
+            g_pt.tcp4_ts = now;
+            return TRUE;
+        }
         free(tbl);
-        return FALSE;
+        if (rc != ERROR_INSUFFICIENT_BUFFER)
+            return FALSE;
     }
-    free(g_pt.tcp4);
-    g_pt.tcp4 = tbl;
-    g_pt.tcp4_bytes = size;
-    g_pt.tcp4_ts = now;
-    return TRUE;
+    return FALSE;
 }
 
 static BOOL refresh_udp4(void)
@@ -121,22 +129,28 @@ static BOOL refresh_udp4(void)
     if (g_pt.udp4 && (now - g_pt.udp4_ts) < PID_SNAP_TTL_MS)
         return TRUE;
 
-    DWORD size = 0;
-    DWORD rc = GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-    if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
-        return FALSE;
+    for (int retry = 0; retry < 3; retry++)
+    {
+        DWORD size = 0;
+        DWORD rc = GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+        if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
+            return FALSE;
 
-    MIB_UDPTABLE_OWNER_PID *tbl = (MIB_UDPTABLE_OWNER_PID *)malloc(size);
-    if (!tbl) return FALSE;
-    if (GetExtendedUdpTable(tbl, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) != NO_ERROR) {
+        MIB_UDPTABLE_OWNER_PID *tbl = (MIB_UDPTABLE_OWNER_PID *)malloc(size);
+        if (!tbl) return FALSE;
+        rc = GetExtendedUdpTable(tbl, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+        if (rc == NO_ERROR) {
+            free(g_pt.udp4);
+            g_pt.udp4 = tbl;
+            g_pt.udp4_bytes = size;
+            g_pt.udp4_ts = now;
+            return TRUE;
+        }
         free(tbl);
-        return FALSE;
+        if (rc != ERROR_INSUFFICIENT_BUFFER)
+            return FALSE;
     }
-    free(g_pt.udp4);
-    g_pt.udp4 = tbl;
-    g_pt.udp4_bytes = size;
-    g_pt.udp4_ts = now;
-    return TRUE;
+    return FALSE;
 }
 
 static BOOL refresh_tcp6(void)
@@ -145,22 +159,28 @@ static BOOL refresh_tcp6(void)
     if (g_pt.tcp6 && (now - g_pt.tcp6_ts) < PID_SNAP_TTL_MS)
         return TRUE;
 
-    DWORD size = 0;
-    DWORD rc = GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
-    if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
-        return FALSE;
+    for (int retry = 0; retry < 3; retry++)
+    {
+        DWORD size = 0;
+        DWORD rc = GetExtendedTcpTable(NULL, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
+            return FALSE;
 
-    MIB_TCP6TABLE_OWNER_PID *tbl = (MIB_TCP6TABLE_OWNER_PID *)malloc(size);
-    if (!tbl) return FALSE;
-    if (GetExtendedTcpTable(tbl, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+        MIB_TCP6TABLE_OWNER_PID *tbl = (MIB_TCP6TABLE_OWNER_PID *)malloc(size);
+        if (!tbl) return FALSE;
+        rc = GetExtendedTcpTable(tbl, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+        if (rc == NO_ERROR) {
+            free(g_pt.tcp6);
+            g_pt.tcp6 = tbl;
+            g_pt.tcp6_bytes = size;
+            g_pt.tcp6_ts = now;
+            return TRUE;
+        }
         free(tbl);
-        return FALSE;
+        if (rc != ERROR_INSUFFICIENT_BUFFER)
+            return FALSE;
     }
-    free(g_pt.tcp6);
-    g_pt.tcp6 = tbl;
-    g_pt.tcp6_bytes = size;
-    g_pt.tcp6_ts = now;
-    return TRUE;
+    return FALSE;
 }
 
 static BOOL refresh_udp6(void)
@@ -169,22 +189,28 @@ static BOOL refresh_udp6(void)
     if (g_pt.udp6 && (now - g_pt.udp6_ts) < PID_SNAP_TTL_MS)
         return TRUE;
 
-    DWORD size = 0;
-    DWORD rc = GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
-    if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
-        return FALSE;
+    for (int retry = 0; retry < 3; retry++)
+    {
+        DWORD size = 0;
+        DWORD rc = GetExtendedUdpTable(NULL, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+        if (rc != ERROR_INSUFFICIENT_BUFFER || size == 0)
+            return FALSE;
 
-    MIB_UDP6TABLE_OWNER_PID *tbl = (MIB_UDP6TABLE_OWNER_PID *)malloc(size);
-    if (!tbl) return FALSE;
-    if (GetExtendedUdpTable(tbl, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0) != NO_ERROR) {
+        MIB_UDP6TABLE_OWNER_PID *tbl = (MIB_UDP6TABLE_OWNER_PID *)malloc(size);
+        if (!tbl) return FALSE;
+        rc = GetExtendedUdpTable(tbl, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+        if (rc == NO_ERROR) {
+            free(g_pt.udp6);
+            g_pt.udp6 = tbl;
+            g_pt.udp6_bytes = size;
+            g_pt.udp6_ts = now;
+            return TRUE;
+        }
         free(tbl);
-        return FALSE;
+        if (rc != ERROR_INSUFFICIENT_BUFFER)
+            return FALSE;
     }
-    free(g_pt.udp6);
-    g_pt.udp6 = tbl;
-    g_pt.udp6_bytes = size;
-    g_pt.udp6_ts = now;
-    return TRUE;
+    return FALSE;
 }
 
 DWORD nb_pid_lookup_tcp4(UINT32 src_ip, UINT16 src_port)
