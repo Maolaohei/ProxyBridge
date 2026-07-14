@@ -46,10 +46,12 @@ typedef struct {
     MIB_TCP6TABLE_OWNER_PID *tcp6;
     DWORD tcp6_bytes;
     ULONGLONG tcp6_ts;
+    PortIndex tcp6_idx[65536];
 
     MIB_UDP6TABLE_OWNER_PID *udp6;
     DWORD udp6_bytes;
     ULONGLONG udp6_ts;
+    PortIndex udp6_idx[65536];
 
     SRWLOCK lock;
     PidEntry cache[PID_ENTRY_CACHE];
@@ -76,6 +78,8 @@ void nb_pid_table_shutdown(void)
     ZeroMemory(g_pt.cache, sizeof(g_pt.cache));
     ZeroMemory(g_pt.tcp4_idx, sizeof(g_pt.tcp4_idx));
     ZeroMemory(g_pt.udp4_idx, sizeof(g_pt.udp4_idx));
+    ZeroMemory(g_pt.tcp6_idx, sizeof(g_pt.tcp6_idx));
+    ZeroMemory(g_pt.udp6_idx, sizeof(g_pt.udp6_idx));
     ReleaseSRWLockExclusive(&g_pt.lock);
 }
 
@@ -85,7 +89,8 @@ static UINT32 cache_hash(UINT32 ip, UINT16 port, BOOL is_udp)
     return h % PID_ENTRY_CACHE;
 }
 
-static DWORD cache_get(UINT32 ip, UINT16 port, BOOL is_udp)
+/* Caller must hold lock (shared for get, exclusive for put). */
+static DWORD cache_get_locked(UINT32 ip, UINT16 port, BOOL is_udp)
 {
     ULONGLONG now = GetTickCount64();
     UINT32 start = cache_hash(ip, port, is_udp);
@@ -100,7 +105,8 @@ static DWORD cache_get(UINT32 ip, UINT16 port, BOOL is_udp)
     return 0;
 }
 
-static void cache_put(UINT32 ip, UINT16 port, DWORD pid, BOOL is_udp)
+/* Caller must hold exclusive lock. */
+static void cache_put_locked(UINT32 ip, UINT16 port, DWORD pid, BOOL is_udp)
 {
     if (pid == 0) return;
     UINT32 start = cache_hash(ip, port, is_udp);
@@ -170,6 +176,45 @@ static void rebuild_udp4_index(void)
             ix->ip = row->dwLocalAddr;
             ix->multi = 0;
         } else if (ix->ip != row->dwLocalAddr || ix->pid != row->dwOwningPid) {
+            ix->multi = 1;
+        }
+    }
+}
+
+/* IPv6 port index: multi when multiple owners/scopes share the port. */
+static void rebuild_tcp6_index(void)
+{
+    ZeroMemory(g_pt.tcp6_idx, sizeof(g_pt.tcp6_idx));
+    if (!g_pt.tcp6) return;
+    for (DWORD i = 0; i < g_pt.tcp6->dwNumEntries; i++) {
+        MIB_TCP6ROW_OWNER_PID *row = &g_pt.tcp6->table[i];
+        UINT16 port = ntohs((UINT16)row->dwLocalPort);
+        PortIndex *ix = &g_pt.tcp6_idx[port];
+        if (!ix->used) {
+            ix->used = 1;
+            ix->pid = row->dwOwningPid;
+            ix->ip = 0;
+            ix->multi = 0;
+        } else if (ix->pid != row->dwOwningPid) {
+            ix->multi = 1;
+        }
+    }
+}
+
+static void rebuild_udp6_index(void)
+{
+    ZeroMemory(g_pt.udp6_idx, sizeof(g_pt.udp6_idx));
+    if (!g_pt.udp6) return;
+    for (DWORD i = 0; i < g_pt.udp6->dwNumEntries; i++) {
+        MIB_UDP6ROW_OWNER_PID *row = &g_pt.udp6->table[i];
+        UINT16 port = ntohs((UINT16)row->dwLocalPort);
+        PortIndex *ix = &g_pt.udp6_idx[port];
+        if (!ix->used) {
+            ix->used = 1;
+            ix->pid = row->dwOwningPid;
+            ix->ip = 0;
+            ix->multi = 0;
+        } else if (ix->pid != row->dwOwningPid) {
             ix->multi = 1;
         }
     }
@@ -276,6 +321,7 @@ static BOOL refresh_tcp6(void)
             if (rc == NO_ERROR) {
                 g_pt.tcp6_bytes = size;
                 g_pt.tcp6_ts = now;
+                rebuild_tcp6_index();
                 return TRUE;
             }
             if (rc != ERROR_INSUFFICIENT_BUFFER)
@@ -296,6 +342,7 @@ static BOOL refresh_tcp6(void)
         if (rc == NO_ERROR) {
             g_pt.tcp6_bytes = size;
             g_pt.tcp6_ts = now;
+            rebuild_tcp6_index();
             return TRUE;
         }
         if (rc != ERROR_INSUFFICIENT_BUFFER)
@@ -318,6 +365,7 @@ static BOOL refresh_udp6(void)
             if (rc == NO_ERROR) {
                 g_pt.udp6_bytes = size;
                 g_pt.udp6_ts = now;
+                rebuild_udp6_index();
                 return TRUE;
             }
             if (rc != ERROR_INSUFFICIENT_BUFFER)
@@ -338,6 +386,7 @@ static BOOL refresh_udp6(void)
         if (rc == NO_ERROR) {
             g_pt.udp6_bytes = size;
             g_pt.udp6_ts = now;
+            rebuild_udp6_index();
             return TRUE;
         }
         if (rc != ERROR_INSUFFICIENT_BUFFER)
@@ -377,6 +426,37 @@ static DWORD scan_udp4(UINT32 src_ip, UINT16 src_port)
     return 0;
 }
 
+static DWORD scan_tcp6(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    if (!g_pt.tcp6) return 0;
+    for (DWORD i = 0; i < g_pt.tcp6->dwNumEntries; i++) {
+        MIB_TCP6ROW_OWNER_PID *row = &g_pt.tcp6->table[i];
+        if (ntohs((UINT16)row->dwLocalPort) == src_port &&
+            memcmp(row->ucLocalAddr, src_ip6, 16) == 0)
+            return row->dwOwningPid;
+    }
+    return 0;
+}
+
+static DWORD scan_udp6(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    if (!g_pt.udp6) return 0;
+    for (DWORD i = 0; i < g_pt.udp6->dwNumEntries; i++) {
+        MIB_UDP6ROW_OWNER_PID *row = &g_pt.udp6->table[i];
+        if (ntohs((UINT16)row->dwLocalPort) == src_port &&
+            memcmp(row->ucLocalAddr, src_ip6, 16) == 0)
+            return row->dwOwningPid;
+    }
+    static const UINT8 zero[16] = {0};
+    for (DWORD i = 0; i < g_pt.udp6->dwNumEntries; i++) {
+        MIB_UDP6ROW_OWNER_PID *row = &g_pt.udp6->table[i];
+        if (ntohs((UINT16)row->dwLocalPort) == src_port &&
+            memcmp(row->ucLocalAddr, zero, 16) == 0)
+            return row->dwOwningPid;
+    }
+    return 0;
+}
+
 static DWORD lookup_tcp4_indexed(UINT32 src_ip, UINT16 src_port)
 {
     PortIndex *ix = &g_pt.tcp4_idx[src_port];
@@ -397,20 +477,36 @@ static DWORD lookup_udp4_indexed(UINT32 src_ip, UINT16 src_port)
     return 0;
 }
 
+static DWORD lookup_tcp6_indexed(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    PortIndex *ix = &g_pt.tcp6_idx[src_port];
+    if (!ix->used) return 0;
+    if (ix->multi) return scan_tcp6(src_ip6, src_port);
+    return ix->pid ? scan_tcp6(src_ip6, src_port) : 0;
+}
+
+static DWORD lookup_udp6_indexed(const UINT8 src_ip6[16], UINT16 src_port)
+{
+    PortIndex *ix = &g_pt.udp6_idx[src_port];
+    if (!ix->used) return 0;
+    if (ix->multi) return scan_udp6(src_ip6, src_port);
+    return ix->pid ? scan_udp6(src_ip6, src_port) : 0;
+}
+
 DWORD nb_pid_lookup_tcp4(UINT32 src_ip, UINT16 src_port)
 {
     if (!g_pt.inited) nb_pid_table_init();
-    DWORD cached = cache_get(src_ip, src_port, FALSE);
-    if (cached) return cached;
 
     AcquireSRWLockShared(&g_pt.lock);
-    cached = cache_get(src_ip, src_port, FALSE);
+    DWORD cached = cache_get_locked(src_ip, src_port, FALSE);
     if (cached) { ReleaseSRWLockShared(&g_pt.lock); return cached; }
     if (g_pt.tcp4 && (GetTickCount64() - g_pt.tcp4_ts) < PID_SNAP_TTL_MS) {
         DWORD pid = lookup_tcp4_indexed(src_ip, src_port);
         ReleaseSRWLockShared(&g_pt.lock);
         if (pid) {
-            cache_put(src_ip, src_port, pid, FALSE);
+            AcquireSRWLockExclusive(&g_pt.lock);
+            cache_put_locked(src_ip, src_port, pid, FALSE);
+            ReleaseSRWLockExclusive(&g_pt.lock);
             return pid;
         }
     } else {
@@ -418,13 +514,13 @@ DWORD nb_pid_lookup_tcp4(UINT32 src_ip, UINT16 src_port)
     }
 
     AcquireSRWLockExclusive(&g_pt.lock);
-    cached = cache_get(src_ip, src_port, FALSE);
+    cached = cache_get_locked(src_ip, src_port, FALSE);
     if (cached) { ReleaseSRWLockExclusive(&g_pt.lock); return cached; }
 
     DWORD pid = 0;
     if (refresh_tcp4())
         pid = lookup_tcp4_indexed(src_ip, src_port);
-    cache_put(src_ip, src_port, pid, FALSE);
+    cache_put_locked(src_ip, src_port, pid, FALSE);
     ReleaseSRWLockExclusive(&g_pt.lock);
     return pid;
 }
@@ -432,17 +528,17 @@ DWORD nb_pid_lookup_tcp4(UINT32 src_ip, UINT16 src_port)
 DWORD nb_pid_lookup_udp4(UINT32 src_ip, UINT16 src_port)
 {
     if (!g_pt.inited) nb_pid_table_init();
-    DWORD cached = cache_get(src_ip, src_port, TRUE);
-    if (cached) return cached;
 
     AcquireSRWLockShared(&g_pt.lock);
-    cached = cache_get(src_ip, src_port, TRUE);
+    DWORD cached = cache_get_locked(src_ip, src_port, TRUE);
     if (cached) { ReleaseSRWLockShared(&g_pt.lock); return cached; }
     if (g_pt.udp4 && (GetTickCount64() - g_pt.udp4_ts) < PID_SNAP_TTL_MS) {
         DWORD pid = lookup_udp4_indexed(src_ip, src_port);
         ReleaseSRWLockShared(&g_pt.lock);
         if (pid) {
-            cache_put(src_ip, src_port, pid, TRUE);
+            AcquireSRWLockExclusive(&g_pt.lock);
+            cache_put_locked(src_ip, src_port, pid, TRUE);
+            ReleaseSRWLockExclusive(&g_pt.lock);
             return pid;
         }
     } else {
@@ -450,13 +546,13 @@ DWORD nb_pid_lookup_udp4(UINT32 src_ip, UINT16 src_port)
     }
 
     AcquireSRWLockExclusive(&g_pt.lock);
-    cached = cache_get(src_ip, src_port, TRUE);
+    cached = cache_get_locked(src_ip, src_port, TRUE);
     if (cached) { ReleaseSRWLockExclusive(&g_pt.lock); return cached; }
 
     DWORD pid = 0;
     if (refresh_udp4())
         pid = lookup_udp4_indexed(src_ip, src_port);
-    cache_put(src_ip, src_port, pid, TRUE);
+    cache_put_locked(src_ip, src_port, pid, TRUE);
     ReleaseSRWLockExclusive(&g_pt.lock);
     return pid;
 }
@@ -465,18 +561,19 @@ DWORD nb_pid_lookup_tcp6(const UINT8 src_ip6[16], UINT16 src_port)
 {
     if (!g_pt.inited) nb_pid_table_init();
 
+    AcquireSRWLockShared(&g_pt.lock);
+    if (g_pt.tcp6 && (GetTickCount64() - g_pt.tcp6_ts) < PID_SNAP_TTL_MS) {
+        DWORD pid = lookup_tcp6_indexed(src_ip6, src_port);
+        ReleaseSRWLockShared(&g_pt.lock);
+        if (pid) return pid;
+    } else {
+        ReleaseSRWLockShared(&g_pt.lock);
+    }
+
     AcquireSRWLockExclusive(&g_pt.lock);
     DWORD pid = 0;
-    if (refresh_tcp6() && g_pt.tcp6) {
-        for (DWORD i = 0; i < g_pt.tcp6->dwNumEntries; i++) {
-            MIB_TCP6ROW_OWNER_PID *row = &g_pt.tcp6->table[i];
-            if (ntohs((UINT16)row->dwLocalPort) == src_port &&
-                memcmp(row->ucLocalAddr, src_ip6, 16) == 0) {
-                pid = row->dwOwningPid;
-                break;
-            }
-        }
-    }
+    if (refresh_tcp6())
+        pid = lookup_tcp6_indexed(src_ip6, src_port);
     ReleaseSRWLockExclusive(&g_pt.lock);
     return pid;
 }
@@ -485,29 +582,19 @@ DWORD nb_pid_lookup_udp6(const UINT8 src_ip6[16], UINT16 src_port)
 {
     if (!g_pt.inited) nb_pid_table_init();
 
+    AcquireSRWLockShared(&g_pt.lock);
+    if (g_pt.udp6 && (GetTickCount64() - g_pt.udp6_ts) < PID_SNAP_TTL_MS) {
+        DWORD pid = lookup_udp6_indexed(src_ip6, src_port);
+        ReleaseSRWLockShared(&g_pt.lock);
+        if (pid) return pid;
+    } else {
+        ReleaseSRWLockShared(&g_pt.lock);
+    }
+
     AcquireSRWLockExclusive(&g_pt.lock);
     DWORD pid = 0;
-    if (refresh_udp6() && g_pt.udp6) {
-        for (DWORD i = 0; i < g_pt.udp6->dwNumEntries; i++) {
-            MIB_UDP6ROW_OWNER_PID *row = &g_pt.udp6->table[i];
-            if (ntohs((UINT16)row->dwLocalPort) == src_port &&
-                memcmp(row->ucLocalAddr, src_ip6, 16) == 0) {
-                pid = row->dwOwningPid;
-                break;
-            }
-        }
-        if (pid == 0) {
-            static const UINT8 zero[16] = {0};
-            for (DWORD i = 0; i < g_pt.udp6->dwNumEntries; i++) {
-                MIB_UDP6ROW_OWNER_PID *row = &g_pt.udp6->table[i];
-                if (ntohs((UINT16)row->dwLocalPort) == src_port &&
-                    memcmp(row->ucLocalAddr, zero, 16) == 0) {
-                    pid = row->dwOwningPid;
-                    break;
-                }
-            }
-        }
-    }
+    if (refresh_udp6())
+        pid = lookup_udp6_indexed(src_ip6, src_port);
     ReleaseSRWLockExclusive(&g_pt.lock);
     return pid;
 }

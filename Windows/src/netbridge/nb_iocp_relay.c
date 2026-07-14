@@ -6,13 +6,8 @@
 
 #define IOCP_BUF_SIZE  131072
 #define IOCP_WORKERS   8
-/* ~256 KB per conn object; keep freelist modest to cap idle RSS. */
+/* ~512 KB per conn object (4 x 128KB); keep freelist modest to cap idle RSS. */
 #define IOCP_POOL_MAX  64
-
-#define IOCP_OP_RECV_A  1
-#define IOCP_OP_SEND_B  2
-#define IOCP_OP_RECV_B  3
-#define IOCP_OP_SEND_A  4
 
 typedef struct _NB_IOCP_CONN {
     OVERLAPPED ov_a_recv;
@@ -27,6 +22,11 @@ typedef struct _NB_IOCP_CONN {
     char data_a_send[IOCP_BUF_SIZE];
     char data_b_recv[IOCP_BUF_SIZE];
     char data_b_send[IOCP_BUF_SIZE];
+    /* Pending send bookkeeping for partial WSASend completions. */
+    DWORD pending_a_send; /* remaining bytes on A->B path (stored in data_a_recv) */
+    DWORD pending_b_send; /* remaining bytes on B->A path (stored in data_b_recv) */
+    DWORD offset_a_send;
+    DWORD offset_b_send;
     SOCKET sock_a;
     SOCKET sock_b;
     volatile LONG active;
@@ -50,6 +50,10 @@ static void conn_reset_bufs(NB_IOCP_CONN *c)
     ZeroMemory(&c->ov_b_send, sizeof(OVERLAPPED));
     c->sock_a = INVALID_SOCKET;
     c->sock_b = INVALID_SOCKET;
+    c->pending_a_send = 0;
+    c->pending_b_send = 0;
+    c->offset_a_send = 0;
+    c->offset_b_send = 0;
     c->active = 1;
     InterlockedExchange(&c->refcount, 2);
     c->pool_next = NULL;
@@ -82,7 +86,6 @@ static NB_IOCP_CONN *conn_alloc(void)
 static void conn_free_to_pool(NB_IOCP_CONN *c)
 {
     if (!c) return;
-    /* sockets already closed by release path */
     c->sock_a = INVALID_SOCKET;
     c->sock_b = INVALID_SOCKET;
     c->active = 0;
@@ -124,6 +127,15 @@ static void conn_release(NB_IOCP_CONN *c)
     }
 }
 
+static void conn_fail(NB_IOCP_CONN *c)
+{
+    if (!c) return;
+    InterlockedExchange(&c->active, 0);
+    if (c->sock_a != INVALID_SOCKET) shutdown(c->sock_a, SD_BOTH);
+    if (c->sock_b != INVALID_SOCKET) shutdown(c->sock_b, SD_BOTH);
+    conn_release(c);
+}
+
 static BOOL post_recv(SOCKET sock, OVERLAPPED *ov, WSABUF *buf)
 {
     memset(ov, 0, sizeof(*ov));
@@ -140,6 +152,22 @@ static BOOL post_send(SOCKET sock, OVERLAPPED *ov, WSABUF *buf)
     return (rc == 0 || WSAGetLastError() == WSA_IO_PENDING);
 }
 
+/* A-recv buffer is forwarded to B via ov_b_send (pending_b_send / offset_b_send). */
+static BOOL post_send_to_b(NB_IOCP_CONN *conn)
+{
+    conn->buf_b_send.buf = conn->data_a_recv + conn->offset_b_send;
+    conn->buf_b_send.len = conn->pending_b_send;
+    return post_send(conn->sock_b, &conn->ov_b_send, &conn->buf_b_send);
+}
+
+/* B-recv buffer is forwarded to A via ov_a_send (pending_a_send / offset_a_send). */
+static BOOL post_send_to_a(NB_IOCP_CONN *conn)
+{
+    conn->buf_a_send.buf = conn->data_b_recv + conn->offset_a_send;
+    conn->buf_a_send.len = conn->pending_a_send;
+    return post_send(conn->sock_a, &conn->ov_a_send, &conn->buf_a_send);
+}
+
 static DWORD WINAPI worker_main(LPVOID arg)
 {
     (void)arg;
@@ -149,46 +177,56 @@ static DWORD WINAPI worker_main(LPVOID arg)
         OVERLAPPED *ov = NULL;
         BOOL ok = GetQueuedCompletionStatus(g_iocp, &bytes, &key, &ov, INFINITE);
         if (!ov) {
-            /* shutdown packet */
             if (!ok) break;
             continue;
         }
         NB_IOCP_CONN *conn = (NB_IOCP_CONN *)key;
         if (!ok || !conn->active || bytes == 0) {
-            InterlockedExchange(&conn->active, 0);
-            if (conn->sock_a != INVALID_SOCKET) shutdown(conn->sock_a, SD_BOTH);
-            if (conn->sock_b != INVALID_SOCKET) shutdown(conn->sock_b, SD_BOTH);
-            conn_release(conn);
+            conn_fail(conn);
             continue;
         }
 
         if (ov == &conn->ov_a_recv) {
-            conn->buf_b_send.buf = conn->data_a_recv;
-            conn->buf_b_send.len = bytes;
-            if (!post_send(conn->sock_b, &conn->ov_b_send, &conn->buf_b_send)) {
-                InterlockedExchange(&conn->active, 0);
-                conn_release(conn);
-            }
+            /* data_a_recv[0..bytes) -> B */
+            conn->pending_b_send = bytes;
+            conn->offset_b_send = 0;
+            if (!post_send_to_b(conn))
+                conn_fail(conn);
         } else if (ov == &conn->ov_b_send) {
-            conn->buf_a_recv.buf = conn->data_a_recv;
-            conn->buf_a_recv.len = IOCP_BUF_SIZE;
-            if (!post_recv(conn->sock_a, &conn->ov_a_recv, &conn->buf_a_recv)) {
-                InterlockedExchange(&conn->active, 0);
-                conn_release(conn);
+            if (bytes > conn->pending_b_send)
+                bytes = conn->pending_b_send;
+            conn->pending_b_send -= bytes;
+            conn->offset_b_send += bytes;
+            if (conn->pending_b_send > 0) {
+                if (!post_send_to_b(conn))
+                    conn_fail(conn);
+            } else {
+                conn->offset_b_send = 0;
+                conn->buf_a_recv.buf = conn->data_a_recv;
+                conn->buf_a_recv.len = IOCP_BUF_SIZE;
+                if (!post_recv(conn->sock_a, &conn->ov_a_recv, &conn->buf_a_recv))
+                    conn_fail(conn);
             }
         } else if (ov == &conn->ov_b_recv) {
-            conn->buf_a_send.buf = conn->data_b_recv;
-            conn->buf_a_send.len = bytes;
-            if (!post_send(conn->sock_a, &conn->ov_a_send, &conn->buf_a_send)) {
-                InterlockedExchange(&conn->active, 0);
-                conn_release(conn);
-            }
+            /* data_b_recv[0..bytes) -> A */
+            conn->pending_a_send = bytes;
+            conn->offset_a_send = 0;
+            if (!post_send_to_a(conn))
+                conn_fail(conn);
         } else if (ov == &conn->ov_a_send) {
-            conn->buf_b_recv.buf = conn->data_b_recv;
-            conn->buf_b_recv.len = IOCP_BUF_SIZE;
-            if (!post_recv(conn->sock_b, &conn->ov_b_recv, &conn->buf_b_recv)) {
-                InterlockedExchange(&conn->active, 0);
-                conn_release(conn);
+            if (bytes > conn->pending_a_send)
+                bytes = conn->pending_a_send;
+            conn->pending_a_send -= bytes;
+            conn->offset_a_send += bytes;
+            if (conn->pending_a_send > 0) {
+                if (!post_send_to_a(conn))
+                    conn_fail(conn);
+            } else {
+                conn->offset_a_send = 0;
+                conn->buf_b_recv.buf = conn->data_b_recv;
+                conn->buf_b_recv.len = IOCP_BUF_SIZE;
+                if (!post_recv(conn->sock_b, &conn->ov_b_recv, &conn->buf_b_recv))
+                    conn_fail(conn);
             }
         }
     }
@@ -272,7 +310,7 @@ int nb_iocp_relay_start(SOCKET a, SOCKET b)
         return -1;
     }
     if (!post_recv(b, &conn->ov_b_recv, &conn->buf_b_recv)) {
-        /* A recv already posted: keep ownership in conn and let worker tear down. */
+        /* A recv already posted: ownership stays with IOCP for teardown. */
         InterlockedExchange(&conn->active, 0);
         shutdown(a, SD_BOTH);
         shutdown(b, SD_BOTH);

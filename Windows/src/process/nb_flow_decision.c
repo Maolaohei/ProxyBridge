@@ -1,4 +1,4 @@
-﻿#include "process/nb_flow_decision.h"
+#include "process/nb_flow_decision.h"
 
 #include <string.h>
 
@@ -82,10 +82,31 @@ void nb_flow_decision_clear_all(void)
 void nb_flow_decision_expire(void)
 {
     ULONGLONG now = now_ms();
+    LONG decided_local[2048];
+    LONG direct_local[2048];
+    ZeroMemory(decided_local, sizeof(decided_local));
+    ZeroMemory(direct_local, sizeof(direct_local));
+
     AcquireSRWLockExclusive(&g_lock);
     for (UINT32 i = 0; i < FLOW_TABLE_SIZE; i++) {
         if (g_table[i].used && g_table[i].expires <= now)
             g_table[i].used = 0;
+    }
+    /* Rebuild under exclusive lock; port_set/clear use the same lock. */
+    for (UINT32 i = 0; i < FLOW_TABLE_SIZE; i++) {
+        FlowEntry *e = &g_table[i];
+        if (!e->used || e->expires <= now)
+            continue;
+        UINT16 p = e->src_port;
+        UINT32 idx = (UINT32)p >> 5;
+        LONG mask = (LONG)(1u << (p & 31));
+        decided_local[idx] |= mask;
+        if (e->decision == (UINT8)NB_FLOW_DIRECT)
+            direct_local[idx] |= mask;
+    }
+    for (UINT32 i = 0; i < 2048; i++) {
+        InterlockedExchange(&g_port_decided[i], decided_local[i]);
+        InterlockedExchange(&g_port_direct[i], direct_local[i]);
     }
     ReleaseSRWLockExclusive(&g_lock);
 }
@@ -321,22 +342,30 @@ BOOL nb_port_is_direct(UINT16 p)
 void nb_port_set_direct(UINT16 p)
 {
     if (!g_inited) nb_flow_decision_init();
+    AcquireSRWLockExclusive(&g_lock);
     port_bit_set(g_port_decided, p);
     port_bit_set(g_port_direct, p);
+    ReleaseSRWLockExclusive(&g_lock);
 }
 
 void nb_port_set_decided(UINT16 p)
 {
     if (!g_inited) nb_flow_decision_init();
+    AcquireSRWLockExclusive(&g_lock);
     port_bit_set(g_port_decided, p);
     port_bit_clear(g_port_direct, p);
+    ReleaseSRWLockExclusive(&g_lock);
 }
 
 void nb_port_clear(UINT16 p)
 {
+    if (!g_inited) return;
+    AcquireSRWLockExclusive(&g_lock);
     port_bit_clear(g_port_decided, p);
     port_bit_clear(g_port_direct, p);
-    /* Also drop any 5-tuple entries using this local source port. */
-    nb_flow_clear_src_port_v4(p);
-    nb_flow_clear_src_port_v6(p);
+    for (UINT32 i = 0; i < FLOW_TABLE_SIZE; i++) {
+        if (g_table[i].used && g_table[i].src_port == p)
+            g_table[i].used = 0;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
 }
