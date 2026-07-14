@@ -71,6 +71,15 @@ PROXYBRIDGE_API BOOL   ProxyBridge_Stop(void);
  * Default: 35000 (CoreDirect). Set to 35002 for NetBridgeBridge relay. */
 PROXYBRIDGE_API void   ProxyBridge_SetRelayPort(UINT16 port);
 
+/* Runtime forward mode:
+ * enable=TRUE  -> NetBridge protocol (CoreDirect / Bridge relay)
+ * enable=FALSE -> Legacy SOCKS5 local relay (34010/34011)
+ * Must be set before ProxyBridge_Start (or before new connections). */
+PROXYBRIDGE_API void   ProxyBridge_SetUseNetBridgeProtocol(BOOL enable);
+
+/* DNS via proxy (Windows). When disabled, UDP/TCP port 53 is forced DIRECT. */
+PROXYBRIDGE_API void   ProxyBridge_SetDnsViaProxy(BOOL enable);
+
 // v2.1.0: Version and diagnostics APIs
 PROXYBRIDGE_API UINT32 ProxyBridge_GetVersion(void);
 PROXYBRIDGE_API int    ProxyBridge_GetLastError(void);

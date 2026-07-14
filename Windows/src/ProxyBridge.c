@@ -226,9 +226,54 @@ static __forceinline void flow6_clear(const UINT8 *sip, UINT16 sp, const UINT8 *
 { nb_flow_clear_v6(sip, sp, dip, dp, proto); }
 
 static UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
+#if NB_USE_NETBRIDGE
+/* Runtime: TRUE = NetBridge protocol redirect (35000/35001), FALSE = Legacy SOCKS relay (34010/34011). */
+static volatile BOOL g_use_netbridge_protocol = TRUE;
+#else
+static volatile BOOL g_use_netbridge_protocol = FALSE;
+#endif
+static volatile BOOL g_dns_via_proxy = TRUE;
 static BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
 static LogCallback g_log_callback = NULL;
 static ConnectionCallback g_connection_callback = NULL;
+
+/* Active redirect ports depend on runtime forward mode.
+ * CoreDirect/Bridge: NetBridge ports; Legacy: local SOCKS relay. */
+static __forceinline UINT16 proxy_tcp_redirect_port(void)
+{
+#if NB_USE_NETBRIDGE
+    return g_use_netbridge_protocol ? (UINT16)NB_CORE_TCP_PORT : g_local_relay_port;
+#else
+    return g_local_relay_port;
+#endif
+}
+
+static __forceinline UINT16 proxy_udp_redirect_port(void)
+{
+#if NB_USE_NETBRIDGE
+    return g_use_netbridge_protocol ? (UINT16)NB_CORE_UDP_PORT : (UINT16)LOCAL_UDP_RELAY_PORT;
+#else
+    return (UINT16)LOCAL_UDP_RELAY_PORT;
+#endif
+}
+
+static __forceinline BOOL is_proxy_tcp_port(UINT16 p)
+{
+    if (p == g_local_relay_port) return TRUE;
+#if NB_USE_NETBRIDGE
+    if (g_use_netbridge_protocol && p == (UINT16)NB_CORE_TCP_PORT) return TRUE;
+#endif
+    return FALSE;
+}
+
+static __forceinline BOOL is_proxy_udp_port(UINT16 p)
+{
+    if (p == (UINT16)LOCAL_UDP_RELAY_PORT) return TRUE;
+#if NB_USE_NETBRIDGE
+    if (g_use_netbridge_protocol && p == (UINT16)NB_CORE_UDP_PORT) return TRUE;
+#endif
+    return FALSE;
+}
 
 static void log_message(const char *msg, ...)
 {
@@ -420,8 +465,8 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + ihl));
                     UINT16 dp = ntohs(*(UINT16*)(packet + ihl + 2));
-                    BOOL is_relay = (sp == g_local_relay_port || dp == g_local_relay_port ||
-                                     sp == LOCAL_UDP_RELAY_PORT || dp == LOCAL_UDP_RELAY_PORT);
+                    BOOL is_relay = (is_proxy_tcp_port(sp) || is_proxy_tcp_port(dp) ||
+                                     is_proxy_udp_port(sp) || is_proxy_udp_port(dp));
                     if (!is_relay)
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
@@ -436,8 +481,8 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 {
                     UINT16 sp = ntohs(*(UINT16*)(packet + 40));
                     UINT16 dp = ntohs(*(UINT16*)(packet + 42));
-                    BOOL is_relay = (sp == g_local_relay_port || dp == g_local_relay_port ||
-                                     sp == LOCAL_UDP_RELAY_PORT || dp == LOCAL_UDP_RELAY_PORT);
+                    BOOL is_relay = (is_proxy_tcp_port(sp) || is_proxy_tcp_port(dp) ||
+                                     is_proxy_udp_port(sp) || is_proxy_udp_port(dp));
                     if (!is_relay)
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
@@ -697,7 +742,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 }
 
                 // relay response: restore original src port and fix up addresses
-                if (sp == (UINT16)g_local_relay_port)
+                if (is_proxy_tcp_port(sp))
                 {
                     UINT16 client_sp = ntohs(tcp_header->DstPort);
                     UINT8  orig_dst6[16];
@@ -724,7 +769,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 if (is_connection_tracked(sp))
                 {
                     if (tcp_header->Fin || tcp_header->Rst) { remove_connection(sp); port_clear(sp); }
-                    tcp_header->DstPort = htons(g_local_relay_port);
+                    tcp_header->DstPort = htons(proxy_tcp_redirect_port());
 
                     static const UINT8 _lb6t[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
                     BOOL both_lb = (memcmp(ipv6_header->SrcAddr, _lb6t, 16) == 0 &&
@@ -825,7 +870,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                     add_connection_v6(sp, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, proxy_config_id6);
                     nb_flow_set_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, 6, NB_FLOW_DECIDED);
                     port_set_decided(sp);
-                    tcp_header->DstPort = htons(g_local_relay_port);
+                    tcp_header->DstPort = htons(proxy_tcp_redirect_port());
 
                     static const UINT8 _lb6p[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
                     BOOL both_lb = (memcmp(ipv6_header->SrcAddr, _lb6p, 16) == 0 &&
@@ -971,13 +1016,8 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                     {
                         add_connection(src_port, src_ip, dest_ip, dest_port, proxy_config_id);
 
-#if NB_USE_NETBRIDGE
-                        /* NetBridge path: redirect to Core UDP port (35001) */
-                        udp_header->DstPort = htons(NB_CORE_UDP_PORT);
-#else
-                        // redirect to UDP relay server at 127.0.0.1:34011
-                        udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
-#endif
+                        /* Runtime mode: CoreDirect/Bridge use 35001, Legacy uses 34011 */
+                        udp_header->DstPort = htons(proxy_udp_redirect_port());
                         ip_header->DstAddr = htonl(INADDR_LOOPBACK);
 
                         // check if source is localhos
@@ -1050,7 +1090,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 }
             }
 
-            if (tcp_header->SrcPort == htons(g_local_relay_port))
+            if (is_proxy_tcp_port(ntohs(tcp_header->SrcPort)))
             {
                 UINT16 dst_port = ntohs(tcp_header->DstPort);
                 UINT32 orig_dest_ip;
@@ -1085,7 +1125,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                     port_clear(src_port);
                 }
 
-                tcp_header->DstPort = htons(g_local_relay_port);
+                tcp_header->DstPort = htons(proxy_tcp_redirect_port());
 
                 BYTE src_first = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
                 BYTE dst_first = (ntohl(ip_header->DstAddr) >> 24) & 0xFF;
@@ -1209,15 +1249,9 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 // branch above handles the actual per-packet redirect.
                 port_set_decided(src_port);
 
-#if NB_USE_NETBRIDGE
-                /* NetBridge path: redirect to port 35000 (Core TCP) instead of 34010.
-                 * The local_proxy_server listener on port 35000 will accept the
-                 * connection and call nb_tcp_forward() to send the NetBridge Header
-                 * and relay traffic directly to Core. */
-                tcp_header->DstPort = htons(NB_CORE_TCP_PORT);
-#else
-                tcp_header->DstPort = htons(g_local_relay_port);
-#endif
+                /* Runtime mode: CoreDirect/Bridge -> NetBridge TCP port;
+                 * Legacy -> SOCKS local relay (g_local_relay_port). */
+                tcp_header->DstPort = htons(proxy_tcp_redirect_port());
 
                 // check if this is localhost -> localhost traffic
                 BYTE src_first_octet = (ntohl(ip_header->SrcAddr) >> 24) & 0xFF;
@@ -1245,7 +1279,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
         }
         else
         {
-            if (tcp_header->DstPort != htons(g_local_relay_port))
+            if (!is_proxy_tcp_port(ntohs(tcp_header->DstPort)))
             {
                 // Unmodified return packet no checksum needed
                 WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
@@ -1949,6 +1983,10 @@ static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest
     // Use unified rule matching function
     UINT32 proxy_config_id = 0;
     RuleAction action = match_rule(process_name, dest_ip, dest_port, is_udp, &proxy_config_id);
+
+    /* DNS via proxy override */
+    if (action == RULE_ACTION_PROXY && !g_dns_via_proxy && dest_port == 53)
+        return RULE_ACTION_DIRECT;
 
     // Additional checks for proxy configuration
     if (action == RULE_ACTION_PROXY)
@@ -4445,15 +4483,25 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
      */
     /* NOTE: WinDivert's 'not' can only negate a single field test (TEST0),
      * not a compound (A or B or C) expression. Use '!=' with 'and' instead. */
-    snprintf(filter, sizeof(filter),
-        "((tcp or udp) and (outbound or loopback) and "
-        "udp.DstPort != 137 and udp.DstPort != 138 and "
-        "udp.DstPort != 5353 and udp.DstPort != 5355) or "
-        "(tcp.DstPort == %d or tcp.SrcPort == %d or "
-        "udp.DstPort == %d or udp.SrcPort == %d) or "
-        "(udp and !outbound and udp.SrcPort == 53)",
-        g_local_relay_port, g_local_relay_port,
-        LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT);
+    {
+        UINT16 tcp_port = proxy_tcp_redirect_port();
+        UINT16 udp_port = proxy_udp_redirect_port();
+        /* Include both active redirect ports and legacy ports so mode switches mid-session
+         * still reverse-NAT correctly for in-flight connections. */
+        snprintf(filter, sizeof(filter),
+            "((tcp or udp) and (outbound or loopback) and "
+            "udp.DstPort != 137 and udp.DstPort != 138 and "
+            "udp.DstPort != 5353 and udp.DstPort != 5355) or "
+            "(tcp.DstPort == %d or tcp.SrcPort == %d or "
+            "tcp.DstPort == %d or tcp.SrcPort == %d or "
+            "udp.DstPort == %d or udp.SrcPort == %d or "
+            "udp.DstPort == %d or udp.SrcPort == %d) or "
+            "(udp and !outbound and udp.SrcPort == 53)",
+            g_local_relay_port, g_local_relay_port,
+            tcp_port, tcp_port,
+            LOCAL_UDP_RELAY_PORT, LOCAL_UDP_RELAY_PORT,
+            udp_port, udp_port);
+    }
 
     /* Ensure our WinDivert driver is installed before opening.
      * If another program installed an older driver, we replace it with ours.
@@ -4675,6 +4723,25 @@ PROXYBRIDGE_API void ProxyBridge_SetRelayPort(UINT16 port)
 #else
     (void)port;
 #endif
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetUseNetBridgeProtocol(BOOL enable)
+{
+#if NB_USE_NETBRIDGE
+    g_use_netbridge_protocol = enable ? TRUE : FALSE;
+    log_message("[NetBridge] Forward protocol: %s",
+        g_use_netbridge_protocol ? "NetBridge (CoreDirect/Bridge)" : "Legacy SOCKS5 relay");
+#else
+    g_use_netbridge_protocol = FALSE;
+    (void)enable;
+    log_message("[NetBridge] Built without NetBridge protocol; forcing Legacy SOCKS5 relay");
+#endif
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetDnsViaProxy(BOOL enable)
+{
+    g_dns_via_proxy = enable ? TRUE : FALSE;
+    log_message("DNS via proxy: %s", g_dns_via_proxy ? "enabled" : "disabled (port 53 direct)");
 }
 
 /* ===== v2.1.0: Version and Diagnostics APIs ===== */
