@@ -1,11 +1,13 @@
-﻿#include "netbridge/nb_iocp_relay.h"
+#include "netbridge/nb_iocp_relay.h"
 
 #include <mswsock.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define IOCP_BUF_SIZE  65536
+#define IOCP_BUF_SIZE  131072
 #define IOCP_WORKERS   8
+/* ~256 KB per conn object; keep freelist modest to cap idle RSS. */
+#define IOCP_POOL_MAX  64
 
 #define IOCP_OP_RECV_A  1
 #define IOCP_OP_SEND_B  2
@@ -29,37 +31,96 @@ typedef struct _NB_IOCP_CONN {
     SOCKET sock_b;
     volatile LONG active;
     volatile LONG refcount;
+    struct _NB_IOCP_CONN *pool_next;
 } NB_IOCP_CONN;
 
 static HANDLE g_iocp = NULL;
 static HANDLE g_workers[IOCP_WORKERS];
 static volatile LONG g_inited = 0;
 static volatile LONG g_active_conns = 0;
+static NB_IOCP_CONN *g_pool_free = NULL;
+static volatile LONG g_pool_free_count = 0;
+static SRWLOCK g_pool_lock = SRWLOCK_INIT;
 
-static NB_IOCP_CONN *conn_alloc(void)
+static void conn_reset_bufs(NB_IOCP_CONN *c)
 {
-    NB_IOCP_CONN *c = (NB_IOCP_CONN *)calloc(1, sizeof(NB_IOCP_CONN));
-    if (!c) return NULL;
+    ZeroMemory(&c->ov_a_recv, sizeof(OVERLAPPED));
+    ZeroMemory(&c->ov_a_send, sizeof(OVERLAPPED));
+    ZeroMemory(&c->ov_b_recv, sizeof(OVERLAPPED));
+    ZeroMemory(&c->ov_b_send, sizeof(OVERLAPPED));
     c->sock_a = INVALID_SOCKET;
     c->sock_b = INVALID_SOCKET;
     c->active = 1;
     InterlockedExchange(&c->refcount, 2);
+    c->pool_next = NULL;
     c->buf_a_recv.buf = c->data_a_recv; c->buf_a_recv.len = IOCP_BUF_SIZE;
     c->buf_a_send.buf = c->data_a_send; c->buf_a_send.len = IOCP_BUF_SIZE;
     c->buf_b_recv.buf = c->data_b_recv; c->buf_b_recv.len = IOCP_BUF_SIZE;
     c->buf_b_send.buf = c->data_b_send; c->buf_b_send.len = IOCP_BUF_SIZE;
+}
+
+static NB_IOCP_CONN *conn_alloc(void)
+{
+    NB_IOCP_CONN *c = NULL;
+    AcquireSRWLockExclusive(&g_pool_lock);
+    if (g_pool_free) {
+        c = g_pool_free;
+        g_pool_free = c->pool_next;
+        InterlockedDecrement(&g_pool_free_count);
+    }
+    ReleaseSRWLockExclusive(&g_pool_lock);
+
+    if (!c) {
+        c = (NB_IOCP_CONN *)malloc(sizeof(NB_IOCP_CONN));
+        if (!c) return NULL;
+    }
+    conn_reset_bufs(c);
     InterlockedIncrement(&g_active_conns);
     return c;
+}
+
+static void conn_free_to_pool(NB_IOCP_CONN *c)
+{
+    if (!c) return;
+    /* sockets already closed by release path */
+    c->sock_a = INVALID_SOCKET;
+    c->sock_b = INVALID_SOCKET;
+    c->active = 0;
+    c->refcount = 0;
+    c->pool_next = NULL;
+
+    AcquireSRWLockExclusive(&g_pool_lock);
+    if (g_pool_free_count < IOCP_POOL_MAX) {
+        c->pool_next = g_pool_free;
+        g_pool_free = c;
+        InterlockedIncrement(&g_pool_free_count);
+        c = NULL;
+    }
+    ReleaseSRWLockExclusive(&g_pool_lock);
+
+    if (c) free(c);
+}
+
+static void conn_pool_clear(void)
+{
+    AcquireSRWLockExclusive(&g_pool_lock);
+    while (g_pool_free) {
+        NB_IOCP_CONN *n = g_pool_free->pool_next;
+        free(g_pool_free);
+        g_pool_free = n;
+    }
+    InterlockedExchange(&g_pool_free_count, 0);
+    ReleaseSRWLockExclusive(&g_pool_lock);
 }
 
 static void conn_release(NB_IOCP_CONN *c)
 {
     if (!c) return;
     if (InterlockedDecrement(&c->refcount) == 0) {
-        if (c->sock_a != INVALID_SOCKET) closesocket(c->sock_a);
-        if (c->sock_b != INVALID_SOCKET) closesocket(c->sock_b);
+        if (c->sock_a != INVALID_SOCKET) { closesocket(c->sock_a); c->sock_a = INVALID_SOCKET; }
+        if (c->sock_b != INVALID_SOCKET) { closesocket(c->sock_b); c->sock_b = INVALID_SOCKET; }
         InterlockedDecrement(&g_active_conns);
-        free(c);
+        conn_free_to_pool(c);
     }
 }
 
@@ -95,8 +156,8 @@ static DWORD WINAPI worker_main(LPVOID arg)
         NB_IOCP_CONN *conn = (NB_IOCP_CONN *)key;
         if (!ok || !conn->active || bytes == 0) {
             InterlockedExchange(&conn->active, 0);
-            shutdown(conn->sock_a, SD_BOTH);
-            shutdown(conn->sock_b, SD_BOTH);
+            if (conn->sock_a != INVALID_SOCKET) shutdown(conn->sock_a, SD_BOTH);
+            if (conn->sock_b != INVALID_SOCKET) shutdown(conn->sock_b, SD_BOTH);
             conn_release(conn);
             continue;
         }
@@ -139,6 +200,7 @@ void nb_iocp_relay_init(void)
     if (InterlockedCompareExchange(&g_inited, 1, 0) != 0)
         return;
     ZeroMemory(g_workers, sizeof(g_workers));
+    InitializeSRWLock(&g_pool_lock);
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, IOCP_WORKERS);
     if (!g_iocp) {
         InterlockedExchange(&g_inited, 0);
@@ -163,7 +225,9 @@ void nb_iocp_relay_shutdown(void)
     }
     CloseHandle(g_iocp);
     g_iocp = NULL;
+    conn_pool_clear();
     InterlockedExchange(&g_inited, 0);
+    InterlockedExchange(&g_active_conns, 0);
 }
 
 static void sock_tune(SOCKET s)
